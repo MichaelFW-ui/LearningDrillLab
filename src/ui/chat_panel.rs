@@ -4,6 +4,7 @@ use crate::app::{
     AppState, ChatRole, TopicSort,
 };
 use dioxus::prelude::*;
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag};
 
 #[component]
 #[allow(non_snake_case)]
@@ -145,124 +146,457 @@ pub fn ChatPanel(state: Signal<AppState>) -> Element {
 #[component]
 #[allow(non_snake_case)]
 fn RichMessage(content: String) -> Element {
-    let blocks = parse_rich_blocks(&content);
+    let nodes = parse_markdown(&content);
 
     rsx! {
         div { class: "message assistant rich-message",
-            for block in blocks.iter() {
-                {
-                    match block {
-                        RichBlock::Heading(text) => rsx! { h3 { "{text}" } },
-                        RichBlock::Paragraph(text) => rsx! { p { "{text}" } },
-                        RichBlock::Bullets(items) => rsx! {
-                            ul {
-                                for item in items.iter() {
-                                    li { "{item}" }
-                                }
-                            }
-                        },
-                        RichBlock::Code(code) => rsx! { pre { "{code}" } },
+            for node in nodes.iter() {
+                { render_markdown_node(node) }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum MarkdownNode {
+    Paragraph(Vec<MarkdownNode>),
+    Heading {
+        level: u8,
+        children: Vec<MarkdownNode>,
+    },
+    Text(String),
+    SoftBreak,
+    HardBreak,
+    Rule,
+    Emphasis(Vec<MarkdownNode>),
+    Strong(Vec<MarkdownNode>),
+    Strikethrough(Vec<MarkdownNode>),
+    InlineCode(String),
+    CodeBlock {
+        language: Option<String>,
+        code: String,
+    },
+    List {
+        ordered: bool,
+        start: Option<u64>,
+        items: Vec<MarkdownNode>,
+    },
+    Item(Vec<MarkdownNode>),
+    BlockQuote(Vec<MarkdownNode>),
+    Link {
+        href: String,
+        title: String,
+        children: Vec<MarkdownNode>,
+    },
+    Table {
+        alignments: Vec<Alignment>,
+        children: Vec<MarkdownNode>,
+    },
+    TableHead(Vec<MarkdownNode>),
+    TableRow(Vec<MarkdownNode>),
+    TableCell(Vec<MarkdownNode>),
+    TaskListMarker(bool),
+}
+
+#[derive(Debug)]
+enum MarkdownFrameKind {
+    Paragraph,
+    Heading(u8),
+    Emphasis,
+    Strong,
+    Strikethrough,
+    CodeBlock(Option<String>),
+    List { ordered: bool, start: Option<u64> },
+    Item,
+    BlockQuote,
+    Link { href: String, title: String },
+    Table(Vec<Alignment>),
+    TableHead,
+    TableRow,
+    TableCell,
+}
+
+#[derive(Debug)]
+struct MarkdownFrame {
+    kind: MarkdownFrameKind,
+    children: Vec<MarkdownNode>,
+}
+
+fn parse_markdown(content: &str) -> Vec<MarkdownNode> {
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
+
+    let mut roots = Vec::new();
+    let mut stack = Vec::new();
+
+    for event in Parser::new_ext(content, options) {
+        match event {
+            Event::Start(tag) => stack.push(MarkdownFrame {
+                kind: frame_kind(tag),
+                children: Vec::new(),
+            }),
+            Event::End(_) => {
+                if let Some(frame) = stack.pop() {
+                    push_node(&mut roots, &mut stack, frame.into_node());
+                }
+            }
+            Event::Text(text) => {
+                push_node(&mut roots, &mut stack, MarkdownNode::Text(text.to_string()));
+            }
+            Event::Code(code) => {
+                push_node(
+                    &mut roots,
+                    &mut stack,
+                    MarkdownNode::InlineCode(code.to_string()),
+                );
+            }
+            Event::Html(html) | Event::InlineHtml(html) => {
+                push_node(&mut roots, &mut stack, MarkdownNode::Text(html.to_string()));
+            }
+            Event::SoftBreak => push_node(&mut roots, &mut stack, MarkdownNode::SoftBreak),
+            Event::HardBreak => push_node(&mut roots, &mut stack, MarkdownNode::HardBreak),
+            Event::Rule => push_node(&mut roots, &mut stack, MarkdownNode::Rule),
+            Event::TaskListMarker(checked) => {
+                push_node(
+                    &mut roots,
+                    &mut stack,
+                    MarkdownNode::TaskListMarker(checked),
+                );
+            }
+            Event::InlineMath(math) => {
+                push_node(
+                    &mut roots,
+                    &mut stack,
+                    MarkdownNode::InlineCode(math.to_string()),
+                );
+            }
+            Event::DisplayMath(math) => {
+                push_node(
+                    &mut roots,
+                    &mut stack,
+                    MarkdownNode::CodeBlock {
+                        language: Some("math".to_string()),
+                        code: math.to_string(),
+                    },
+                );
+            }
+            Event::FootnoteReference(reference) => {
+                push_node(
+                    &mut roots,
+                    &mut stack,
+                    MarkdownNode::Text(format!("[{reference}]")),
+                );
+            }
+        }
+    }
+
+    while let Some(frame) = stack.pop() {
+        push_node(&mut roots, &mut stack, frame.into_node());
+    }
+
+    roots
+}
+
+fn frame_kind(tag: Tag<'_>) -> MarkdownFrameKind {
+    match tag {
+        Tag::Paragraph => MarkdownFrameKind::Paragraph,
+        Tag::Heading { level, .. } => MarkdownFrameKind::Heading(heading_level(level)),
+        Tag::BlockQuote(_) => MarkdownFrameKind::BlockQuote,
+        Tag::CodeBlock(kind) => MarkdownFrameKind::CodeBlock(code_language(kind)),
+        Tag::List(start) => MarkdownFrameKind::List {
+            ordered: start.is_some(),
+            start,
+        },
+        Tag::Item => MarkdownFrameKind::Item,
+        Tag::Emphasis => MarkdownFrameKind::Emphasis,
+        Tag::Strong => MarkdownFrameKind::Strong,
+        Tag::Strikethrough => MarkdownFrameKind::Strikethrough,
+        Tag::Link {
+            dest_url, title, ..
+        } => MarkdownFrameKind::Link {
+            href: dest_url.to_string(),
+            title: title.to_string(),
+        },
+        Tag::Image {
+            dest_url, title, ..
+        } => MarkdownFrameKind::Link {
+            href: dest_url.to_string(),
+            title: title.to_string(),
+        },
+        Tag::Table(alignments) => MarkdownFrameKind::Table(alignments),
+        Tag::TableHead => MarkdownFrameKind::TableHead,
+        Tag::TableRow => MarkdownFrameKind::TableRow,
+        Tag::TableCell => MarkdownFrameKind::TableCell,
+        Tag::FootnoteDefinition(_) => MarkdownFrameKind::Paragraph,
+        Tag::HtmlBlock => MarkdownFrameKind::Paragraph,
+        Tag::DefinitionList => MarkdownFrameKind::List {
+            ordered: false,
+            start: None,
+        },
+        Tag::DefinitionListTitle | Tag::DefinitionListDefinition => MarkdownFrameKind::Item,
+        Tag::MetadataBlock(_) => MarkdownFrameKind::Paragraph,
+        Tag::Superscript | Tag::Subscript => MarkdownFrameKind::Emphasis,
+    }
+}
+
+fn heading_level(level: HeadingLevel) -> u8 {
+    match level {
+        HeadingLevel::H1 => 1,
+        HeadingLevel::H2 => 2,
+        HeadingLevel::H3 => 3,
+        HeadingLevel::H4 => 4,
+        HeadingLevel::H5 => 5,
+        HeadingLevel::H6 => 6,
+    }
+}
+
+fn code_language(kind: CodeBlockKind<'_>) -> Option<String> {
+    match kind {
+        CodeBlockKind::Fenced(language) if !language.trim().is_empty() => {
+            Some(language.to_string())
+        }
+        _ => None,
+    }
+}
+
+fn push_node(roots: &mut Vec<MarkdownNode>, stack: &mut [MarkdownFrame], node: MarkdownNode) {
+    if let Some(parent) = stack.last_mut() {
+        parent.children.push(node);
+    } else {
+        roots.push(node);
+    }
+}
+
+impl MarkdownFrame {
+    fn into_node(self) -> MarkdownNode {
+        match self.kind {
+            MarkdownFrameKind::Paragraph => MarkdownNode::Paragraph(self.children),
+            MarkdownFrameKind::Heading(level) => MarkdownNode::Heading {
+                level,
+                children: self.children,
+            },
+            MarkdownFrameKind::Emphasis => MarkdownNode::Emphasis(self.children),
+            MarkdownFrameKind::Strong => MarkdownNode::Strong(self.children),
+            MarkdownFrameKind::Strikethrough => MarkdownNode::Strikethrough(self.children),
+            MarkdownFrameKind::CodeBlock(language) => MarkdownNode::CodeBlock {
+                language,
+                code: collect_text(&self.children),
+            },
+            MarkdownFrameKind::List { ordered, start } => MarkdownNode::List {
+                ordered,
+                start,
+                items: self.children,
+            },
+            MarkdownFrameKind::Item => MarkdownNode::Item(self.children),
+            MarkdownFrameKind::BlockQuote => MarkdownNode::BlockQuote(self.children),
+            MarkdownFrameKind::Link { href, title } => MarkdownNode::Link {
+                href,
+                title,
+                children: self.children,
+            },
+            MarkdownFrameKind::Table(alignments) => MarkdownNode::Table {
+                alignments,
+                children: self.children,
+            },
+            MarkdownFrameKind::TableHead => MarkdownNode::TableHead(self.children),
+            MarkdownFrameKind::TableRow => MarkdownNode::TableRow(self.children),
+            MarkdownFrameKind::TableCell => MarkdownNode::TableCell(self.children),
+        }
+    }
+}
+
+fn collect_text(nodes: &[MarkdownNode]) -> String {
+    let mut text = String::new();
+    for node in nodes {
+        match node {
+            MarkdownNode::Text(value) | MarkdownNode::InlineCode(value) => text.push_str(value),
+            MarkdownNode::SoftBreak | MarkdownNode::HardBreak => text.push('\n'),
+            MarkdownNode::Emphasis(children)
+            | MarkdownNode::Strong(children)
+            | MarkdownNode::Strikethrough(children)
+            | MarkdownNode::Paragraph(children)
+            | MarkdownNode::Item(children)
+            | MarkdownNode::BlockQuote(children)
+            | MarkdownNode::TableHead(children)
+            | MarkdownNode::TableRow(children)
+            | MarkdownNode::TableCell(children) => text.push_str(&collect_text(children)),
+            MarkdownNode::Heading { children, .. } => text.push_str(&collect_text(children)),
+            MarkdownNode::CodeBlock { code, .. } => text.push_str(code),
+            MarkdownNode::List { items, .. } => text.push_str(&collect_text(items)),
+            MarkdownNode::Link { children, .. } => text.push_str(&collect_text(children)),
+            MarkdownNode::Table { children, .. } => text.push_str(&collect_text(children)),
+            MarkdownNode::Rule | MarkdownNode::TaskListMarker(_) => {}
+        }
+    }
+    text
+}
+
+fn render_markdown_node(node: &MarkdownNode) -> Element {
+    match node {
+        MarkdownNode::Paragraph(children) => rsx! {
+            p {
+                for child in children.iter() {
+                    { render_markdown_node(child) }
+                }
+            }
+        },
+        MarkdownNode::Heading { level, children } => {
+            let class_name = format!("md-heading md-h{level}");
+            rsx! {
+                h3 { class: "{class_name}",
+                    for child in children.iter() {
+                        { render_markdown_node(child) }
                     }
                 }
             }
         }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum RichBlock {
-    Heading(String),
-    Paragraph(String),
-    Bullets(Vec<String>),
-    Code(String),
-}
-
-fn parse_rich_blocks(content: &str) -> Vec<RichBlock> {
-    let mut blocks = Vec::new();
-    let mut paragraph = Vec::new();
-    let mut bullets = Vec::new();
-    let mut code = Vec::new();
-    let mut in_code = false;
-
-    for line in content.lines() {
-        let trimmed = line.trim();
-
-        if trimmed.starts_with("```") {
-            if in_code {
-                blocks.push(RichBlock::Code(code.join("\n")));
-                code.clear();
-                in_code = false;
-            } else {
-                flush_paragraph(&mut blocks, &mut paragraph);
-                flush_bullets(&mut blocks, &mut bullets);
-                in_code = true;
+        MarkdownNode::Text(text) => rsx! { "{text}" },
+        MarkdownNode::SoftBreak => rsx! { " " },
+        MarkdownNode::HardBreak => rsx! { br {} },
+        MarkdownNode::Rule => rsx! { hr {} },
+        MarkdownNode::Emphasis(children) => rsx! {
+            em {
+                for child in children.iter() {
+                    { render_markdown_node(child) }
+                }
             }
-            continue;
+        },
+        MarkdownNode::Strong(children) => rsx! {
+            strong {
+                for child in children.iter() {
+                    { render_markdown_node(child) }
+                }
+            }
+        },
+        MarkdownNode::Strikethrough(children) => rsx! {
+            del {
+                for child in children.iter() {
+                    { render_markdown_node(child) }
+                }
+            }
+        },
+        MarkdownNode::InlineCode(code) => rsx! { code { "{code}" } },
+        MarkdownNode::CodeBlock { language, code } => {
+            let language_label = language.as_deref().unwrap_or("");
+            rsx! {
+                div { class: "code-block",
+                    if !language_label.is_empty() {
+                        div { class: "code-language", "{language_label}" }
+                    }
+                    pre { code { "{code}" } }
+                }
+            }
         }
-
-        if in_code {
-            code.push(line.to_string());
-            continue;
+        MarkdownNode::List {
+            ordered,
+            start,
+            items,
+        } => {
+            if *ordered {
+                let start_attr = start.unwrap_or(1).to_string();
+                rsx! {
+                    ol { start: "{start_attr}",
+                        for item in items.iter() {
+                            { render_markdown_node(item) }
+                        }
+                    }
+                }
+            } else {
+                rsx! {
+                    ul {
+                        for item in items.iter() {
+                            { render_markdown_node(item) }
+                        }
+                    }
+                }
+            }
         }
-
-        if trimmed.is_empty() {
-            flush_paragraph(&mut blocks, &mut paragraph);
-            flush_bullets(&mut blocks, &mut bullets);
-            continue;
+        MarkdownNode::Item(children) => rsx! {
+            li {
+                for child in children.iter() {
+                    { render_markdown_node(child) }
+                }
+            }
+        },
+        MarkdownNode::BlockQuote(children) => rsx! {
+            blockquote {
+                for child in children.iter() {
+                    { render_markdown_node(child) }
+                }
+            }
+        },
+        MarkdownNode::Link {
+            href,
+            title,
+            children,
+        } => {
+            let safe_href = safe_link_href(href);
+            rsx! {
+                a {
+                    href: "{safe_href}",
+                    title: "{title}",
+                    target: "_blank",
+                    rel: "noreferrer noopener",
+                    for child in children.iter() {
+                        { render_markdown_node(child) }
+                    }
+                }
+            }
         }
-
-        if let Some(heading) = heading_text(trimmed) {
-            flush_paragraph(&mut blocks, &mut paragraph);
-            flush_bullets(&mut blocks, &mut bullets);
-            blocks.push(RichBlock::Heading(heading.to_string()));
-            continue;
-        }
-
-        if let Some(item) = bullet_text(trimmed) {
-            flush_paragraph(&mut blocks, &mut paragraph);
-            bullets.push(item.to_string());
-            continue;
-        }
-
-        flush_bullets(&mut blocks, &mut bullets);
-        paragraph.push(trimmed.to_string());
+        MarkdownNode::Table {
+            alignments: _,
+            children,
+        } => rsx! {
+            div { class: "table-scroll",
+                table {
+                    for child in children.iter() {
+                        { render_markdown_node(child) }
+                    }
+                }
+            }
+        },
+        MarkdownNode::TableHead(children) => rsx! {
+            thead {
+                for child in children.iter() {
+                    { render_markdown_node(child) }
+                }
+            }
+        },
+        MarkdownNode::TableRow(children) => rsx! {
+            tr {
+                for child in children.iter() {
+                    { render_markdown_node(child) }
+                }
+            }
+        },
+        MarkdownNode::TableCell(children) => rsx! {
+            td {
+                for child in children.iter() {
+                    { render_markdown_node(child) }
+                }
+            }
+        },
+        MarkdownNode::TaskListMarker(checked) => rsx! {
+            input {
+                r#type: "checkbox",
+                checked: *checked,
+                disabled: true,
+            }
+        },
     }
-
-    if in_code && !code.is_empty() {
-        blocks.push(RichBlock::Code(code.join("\n")));
-    }
-    flush_paragraph(&mut blocks, &mut paragraph);
-    flush_bullets(&mut blocks, &mut bullets);
-
-    if blocks.is_empty() {
-        blocks.push(RichBlock::Paragraph(content.trim().to_string()));
-    }
-
-    blocks
 }
 
-fn heading_text(line: &str) -> Option<&str> {
-    line.strip_prefix("### ")
-        .or_else(|| line.strip_prefix("## "))
-        .or_else(|| line.strip_prefix("# "))
-}
-
-fn bullet_text(line: &str) -> Option<&str> {
-    line.strip_prefix("- ")
-        .or_else(|| line.strip_prefix("* "))
-        .or_else(|| line.strip_prefix("• "))
-}
-
-fn flush_paragraph(blocks: &mut Vec<RichBlock>, paragraph: &mut Vec<String>) {
-    if !paragraph.is_empty() {
-        blocks.push(RichBlock::Paragraph(paragraph.join(" ")));
-        paragraph.clear();
-    }
-}
-
-fn flush_bullets(blocks: &mut Vec<RichBlock>, bullets: &mut Vec<String>) {
-    if !bullets.is_empty() {
-        blocks.push(RichBlock::Bullets(std::mem::take(bullets)));
+fn safe_link_href(href: &str) -> String {
+    let trimmed = href.trim();
+    if trimmed.starts_with("http://")
+        || trimmed.starts_with("https://")
+        || trimmed.starts_with("mailto:")
+    {
+        trimmed.to_string()
+    } else {
+        "#".to_string()
     }
 }
 
@@ -279,5 +613,81 @@ fn sort_from_value(value: &str) -> TopicSort {
         "created" => TopicSort::CreatedDesc,
         "title" => TopicSort::TitleAsc,
         _ => TopicSort::UpdatedDesc,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_inline_markdown() {
+        let nodes = parse_markdown("这是 **加粗**、*斜体* 和 `code`。");
+
+        assert!(contains_node(&nodes, |node| matches!(
+            node,
+            MarkdownNode::Strong(_)
+        )));
+        assert!(contains_node(&nodes, |node| matches!(
+            node,
+            MarkdownNode::Emphasis(_)
+        )));
+        assert!(contains_node(&nodes, |node| matches!(
+            node,
+            MarkdownNode::InlineCode(code) if code == "code"
+        )));
+    }
+
+    #[test]
+    fn parses_tables() {
+        let nodes = parse_markdown("| 名称 | 说明 |\n| --- | --- |\n| Box | 堆分配 |\n");
+
+        assert!(contains_node(&nodes, |node| matches!(
+            node,
+            MarkdownNode::Table { .. }
+        )));
+        assert!(contains_node(&nodes, |node| matches!(
+            node,
+            MarkdownNode::TableHead(_)
+        )));
+        assert!(contains_node(&nodes, |node| matches!(
+            node,
+            MarkdownNode::TableCell(_)
+        )));
+    }
+
+    #[test]
+    fn raw_html_is_kept_as_text() {
+        let nodes = parse_markdown("<script>alert(1)</script>");
+
+        assert_eq!(collect_text(&nodes), "<script>alert(1)</script>");
+    }
+
+    fn contains_node(nodes: &[MarkdownNode], predicate: fn(&MarkdownNode) -> bool) -> bool {
+        nodes.iter().any(|node| {
+            predicate(node)
+                || match node {
+                    MarkdownNode::Paragraph(children)
+                    | MarkdownNode::Emphasis(children)
+                    | MarkdownNode::Strong(children)
+                    | MarkdownNode::Strikethrough(children)
+                    | MarkdownNode::Item(children)
+                    | MarkdownNode::BlockQuote(children)
+                    | MarkdownNode::TableHead(children)
+                    | MarkdownNode::TableRow(children)
+                    | MarkdownNode::TableCell(children) => contains_node(children, predicate),
+                    MarkdownNode::Heading { children, .. } => contains_node(children, predicate),
+                    MarkdownNode::List { items, .. } => contains_node(items, predicate),
+                    MarkdownNode::Link { children, .. } => contains_node(children, predicate),
+                    MarkdownNode::Table { children, .. } => contains_node(children, predicate),
+                    MarkdownNode::Text(_)
+                    | MarkdownNode::SoftBreak
+                    | MarkdownNode::HardBreak
+                    | MarkdownNode::Rule
+                    | MarkdownNode::InlineCode(_)
+                    | MarkdownNode::CodeBlock { .. }
+                    | MarkdownNode::TaskListMarker(_) => false,
+                }
+        })
     }
 }

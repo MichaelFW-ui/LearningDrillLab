@@ -194,17 +194,87 @@ textarea:focus, input:focus, select:focus {
 
 .rich-message h3:first-child { margin-top: 0; }
 .rich-message p { margin: 6px 0; }
-.rich-message ul { margin: 6px 0; padding-left: 20px; }
+.rich-message strong { font-weight: 720; }
+.rich-message em { font-style: italic; }
+.rich-message del { color: #65716a; }
+.rich-message a { color: #1f6f61; font-weight: 650; text-decoration: underline; }
+.rich-message ul, .rich-message ol { margin: 6px 0; padding-left: 20px; }
 .rich-message li { margin: 3px 0; }
+.rich-message li > p { margin: 2px 0; }
+.rich-message input[type="checkbox"] { margin-right: 6px; }
+.rich-message blockquote {
+  margin: 8px 0;
+  padding: 4px 0 4px 10px;
+  border-left: 3px solid #9dbeb4;
+  color: #4c5752;
+}
+.rich-message hr {
+  border: 0;
+  border-top: 1px solid #cfd7d2;
+  margin: 10px 0;
+}
+
+.rich-message code {
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 0.92em;
+  background: #dde5df;
+  border-radius: 4px;
+  padding: 1px 4px;
+}
+
+.rich-message .code-block {
+  margin: 8px 0;
+}
+
+.rich-message .code-language {
+  display: inline-block;
+  margin-bottom: 4px;
+  color: #647069;
+  font-size: 12px;
+  font-weight: 650;
+}
 
 .rich-message pre {
-  margin: 8px 0;
+  margin: 0;
   background: #202723;
   color: #eef8f2;
   border-radius: 7px;
   padding: 10px;
   overflow: auto;
-  white-space: pre-wrap;
+  white-space: pre;
+}
+
+.rich-message pre code {
+  display: block;
+  min-width: max-content;
+  background: transparent;
+  border-radius: 0;
+  padding: 0;
+  color: inherit;
+}
+
+.rich-message .table-scroll {
+  margin: 8px 0;
+  overflow-x: auto;
+}
+
+.rich-message table {
+  width: max-content;
+  min-width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.rich-message th, .rich-message td {
+  border: 1px solid #cbd4ce;
+  padding: 6px 8px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.rich-message thead td {
+  background: #dfe8e2;
+  font-weight: 720;
 }
 
 .composer {
