@@ -273,6 +273,15 @@ textarea:focus, input:focus, select:focus {
 }
 
 .answer-box { min-height: 150px; resize: vertical; }
+.code-input {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  tab-size: 2;
+  white-space: pre;
+  overflow: auto;
+  font-variant-ligatures: none;
+}
 .review-box, .experiment-box {
   background: #fbfcfa;
   border: 1px solid #d9ded9;
@@ -320,6 +329,27 @@ textarea:focus, input:focus, select:focus {
 }
 "#;
 
+const APP_JS: &str = r#"
+document.addEventListener("keydown", function(event) {
+  var target = event.target;
+  if (!target || !target.classList || !target.classList.contains("code-input")) {
+    return;
+  }
+
+  if (event.key !== "Tab") {
+    return;
+  }
+
+  event.preventDefault();
+  var start = target.selectionStart || 0;
+  var end = target.selectionEnd || 0;
+  var value = target.value || "";
+  target.value = value.slice(0, start) + "  " + value.slice(end);
+  target.selectionStart = target.selectionEnd = start + 2;
+  target.dispatchEvent(new Event("input", { bubbles: true }));
+});
+"#;
+
 #[allow(non_snake_case)]
 pub fn App() -> Element {
     let state = use_signal(AppState::load);
@@ -327,6 +357,7 @@ pub fn App() -> Element {
 
     rsx! {
         style { "{APP_CSS}" }
+        script { "{APP_JS}" }
         div { class: "app-shell",
             div { class: "topbar",
                 div { class: "brand",

@@ -88,9 +88,15 @@ pub fn DrillPanel(state: Signal<AppState>) -> Element {
                     div { class: "section",
                         h3 { "你的答案" }
                         textarea {
-                            class: "answer-box",
+                            class: "answer-box code-input",
                             value: "{snapshot.answer_input}",
                             placeholder: "在这里写答案或代码...",
+                            spellcheck: "false",
+                            autocomplete: "off",
+                            autocorrect: "off",
+                            autocapitalize: "off",
+                            translate: "no",
+                            wrap: "off",
                             oninput: move |event| update_answer_input(state, event.value())
                         }
                         div { class: "composer-row",
