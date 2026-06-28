@@ -12,210 +12,174 @@ Answer directly and technically. If the learner's challenge is correct, acknowle
 Use Markdown when it improves clarity. Do not return JSON for this follow-up chat."#
 }
 
-pub fn explain_and_generate_prompt(user_topic: &str) -> String {
+pub fn explain_topic_prompt(user_topic: &str) -> String {
     format!(
-        r#"The learner wants to study this programming topic:
+        r#"You are the Concept Explainer agent.
 
+Task:
+- Explain the learner's topic clearly.
+- Do not generate exercises.
+- Do not audit yourself.
+
+Learner topic:
 {user_topic}
 
 Return JSON with this exact shape:
 {{
   "topic_title": "a concise normalized Chinese title for this learning topic, no more than 18 Chinese characters",
-  "explanation": "rich structured explanation in Chinese for the left chat panel. Use markdown-style headings, bullet lists, tables, and short code blocks when useful. The explanation must be detailed enough that the learner can attempt the exercises without needing unstated API knowledge. Include: what problem this construct solves, prerequisites and vocabulary, syntax/API anatomy, mental model, step-by-step mechanics, minimal runnable examples, relevant type/shape/lifetime/state changes, common mistakes, debugging cues, memory hooks, and how the drills map to the concept.",
+  "explanation": "rich structured explanation in Chinese. Use markdown-style headings, bullet lists, tables, and short code blocks when useful. Include: what problem this construct solves, prerequisites and vocabulary, syntax/API anatomy, mental model, step-by-step mechanics, minimal runnable examples, relevant type/shape/lifetime/state changes, common mistakes, debugging cues, and memory hooks.",
   "concept": {{
     "title": "short title",
-    "language": "programming language or Unknown",
+    "language": "programming language, library, framework, or Unknown",
     "summary": "one paragraph summary in Chinese",
     "key_points": ["point 1", "point 2", "point 3"]
-  }},
-  "exercises": [
-    {{
-      "kind": "FillBlank | FixBug | WriteFromScratch | PredictCompileResult",
-      "title": "exercise title",
-      "prompt": "question in Chinese. Do not repeat starter_code here.",
-      "starter_code": "code or empty string",
-      "expected_answer": "reference answer",
-      "hints": ["hint 1"],
-      "difficulty": "easy | medium | hard"
-    }}
-  ]
-}}
-
-Teaching contract:
-- Teach before testing. Any API, rule, operator, syntax form, runtime behavior, type/shape/state transition, or debugging cue required by an exercise must be explained first.
-- Explain mechanisms, not labels. Naming a method, function, keyword, or rule is not teaching it; explain what problem it solves, how it behaves, inputs/outputs, constraints, a small example, and common misuse.
-- Exercises may transfer or combine ideas, but they must stay within the explanation's taught surface area. A learner should not need unstated library trivia to solve them.
-
-Exercise contract:
-- Generate exactly 4 exercises.
-- Choose kinds from FillBlank, FixBug, WriteFromScratch, and PredictCompileResult. Do not force one of each kind.
-- Use FixBug only when the starter_code contains a real, specific, verifiable bug. If uncertainty remains, use prediction, construction, or assertion-based tasks instead.
-- Any prompt claim about failure, compilation, runtime errors, type/shape/lifetime behavior, output values, or API effects must be grounded in actual language/library semantics. Do not guess.
-- Hints are optional guidance, not hidden requirements. If a hinted operation is required, the prompt and starter_code must make that requirement technically necessary or explicitly stated.
-- Each expected_answer must answer the prompt directly and be consistent with starter_code.
-
-Important: if an exercise has code, put that code only in starter_code. The prompt field must contain prose instructions only and must not include markdown code fences."#
-    )
-}
-
-pub fn audit_learning_response_prompt(user_topic: &str, candidate_json: &str) -> String {
-    format!(
-        r#"Audit and repair this generated learning package before it is shown to the learner.
-
-Original learner topic:
-{user_topic}
-
-Candidate JSON:
-{candidate_json}
-
-Return JSON with this exact shape:
-{{
-  "audit": [
-    {{
-      "exercise_title": "candidate exercise title",
-      "claim": "the concrete technical claim being checked, for example whether code errors, output value, type/shape change, API effect, compile behavior, or required fix",
-      "verdict": "valid | false | uncertain | unsupported_by_explanation | misaligned",
-      "action": "keep | rewrite | replace"
-    }}
-  ],
-  "learning_response": {{
-    "topic_title": "a concise normalized Chinese title",
-    "explanation": "repaired rich explanation",
-    "concept": {{
-      "title": "short title",
-      "language": "programming language or Unknown",
-      "summary": "one paragraph summary in Chinese",
-      "key_points": ["point 1", "point 2", "point 3"]
-    }},
-    "exercises": [
-      {{
-        "kind": "FillBlank | FixBug | WriteFromScratch | PredictCompileResult",
-        "title": "exercise title",
-        "prompt": "question in Chinese. Do not repeat starter_code here.",
-        "starter_code": "code or empty string",
-        "expected_answer": "reference answer",
-        "hints": ["hint 1"],
-        "difficulty": "easy | medium | hard"
-      }}
-    ]
   }}
 }}
 
-Audit contract:
-- Treat the candidate as untrusted. Audit the explanation, exercise prompts, starter_code, hints, and expected answers as technical claims.
-- For every candidate exercise, write at least one audit item before deciding whether to keep, rewrite, or replace it.
-- A claim is not valid because it appears in the candidate. Validate it against language/library semantics, not against the candidate's explanation.
-- Keep exactly 4 exercises, but freely rewrite, replace, or reorder flawed exercises.
-- Reject false or uncertain premises. If the candidate claims code fails, compiles, panics, returns a value, changes a type/shape/state, or uses an API effect, that claim must follow from actual language/library semantics. If you cannot verify the claim from reliable knowledge, rewrite the exercise into a safer observation, prediction, construction, or assertion task.
-- Do not preserve FixBug exercises unless the bug is real, specific, and visible from the starter_code and prompt. Otherwise change the kind.
-- Check coverage: every operation or behavior needed by an exercise must be taught in explanation. Expand explanation or replace the exercise.
-- Check alignment: hints must not smuggle extra requirements, and expected_answer must match the repaired prompt.
-- If a prompt says "will error", "cannot", "must", or "requires", the audit item must name the exact semantic rule that makes that statement true. If you cannot name that rule confidently, the verdict is uncertain and the exercise must be rewritten or replaced.
-- Prefer robust exercises with observable targets: predict output, print relevant facts, satisfy explicit assertions, implement a stated transformation, or compare behavior before/after a real change.
-- Return only valid JSON. Do not include audit notes outside the JSON."#
+Constraints:
+- Teach only what you can explain concretely.
+- When behavior depends on runtime, compiler, library version, environment, or configuration, describe that dependency instead of turning it into an absolute rule.
+- Return only valid JSON. Do not wrap JSON in markdown fences."#
     )
 }
 
-pub fn regenerate_exercises_prompt(
+pub fn generate_one_exercise_prompt(
     concept_json: &str,
     explanation_context: &str,
-    previous_exercises_json: &str,
+    previous_exercises_json: Option<&str>,
+    accepted_exercises_json: &str,
+    rejected_exercises_json: &str,
+    slot: usize,
+    target_difficulty: &str,
+    attempt: usize,
 ) -> String {
+    let previous_exercises_context = previous_exercises_json.unwrap_or("[]");
     format!(
-        r#"Generate a replacement exercise set for the existing learning topic.
+        r#"You are the Exercise Writer agent.
+
+Task:
+- Generate exactly one exercise for slot {slot}.
+- The required difficulty for this slot is exactly "{target_difficulty}".
+- Focus only on writing this one exercise.
+- Do not claim that the exercise has been verified.
+- Do not include explanations outside the JSON.
 
 Concept JSON:
 {concept_json}
 
-Existing explanation and follow-up context:
+Explanation/context source of truth:
 {explanation_context}
 
-Previous exercises JSON:
-{previous_exercises_json}
+Previous exercises to avoid repeating:
+{previous_exercises_context}
+
+Already accepted exercises in this generation pass:
+{accepted_exercises_json}
+
+Rejected exercises and reasons from this generation pass:
+{rejected_exercises_json}
 
 Return JSON with this exact shape:
 {{
-  "exercises": [
-    {{
-      "kind": "FillBlank | FixBug | WriteFromScratch | PredictCompileResult",
-      "title": "exercise title",
-      "prompt": "question in Chinese. Do not repeat starter_code here.",
-      "starter_code": "code or empty string",
-      "expected_answer": "reference answer",
-      "hints": ["hint 1"],
-      "difficulty": "easy | medium | hard"
-    }}
-  ]
+  "kind": "FillBlank | FixBug | WriteFromScratch | PredictCompileResult",
+  "title": "exercise title",
+  "prompt": "question in Chinese. Do not repeat starter_code here.",
+  "starter_code": "code or empty string",
+  "expected_answer": "reference answer",
+  "hints": ["hint 1"],
+  "difficulty": "easy | medium | hard"
 }}
 
-Exercise-only regeneration contract:
-- Do not rewrite, reinterpret, or restate the user's original topic. The concept and existing explanation above are the fixed source of truth.
-- Generate exactly 4 new exercises that practice the existing explanation. Do not return explanation, concept, or title fields.
-- Choose kinds from FillBlank, FixBug, WriteFromScratch, and PredictCompileResult. Do not force one of each kind.
-- Use FixBug only when the starter_code contains a real, specific, verifiable bug. If uncertainty remains, use prediction, construction, or assertion-based tasks instead.
-- Any prompt claim about failure, compilation, runtime errors, type/shape/lifetime behavior, output values, or API effects must be grounded in actual language/library semantics. Do not guess.
-- Hints are optional guidance, not hidden requirements. If a hinted operation is required, the prompt and starter_code must make that requirement technically necessary or explicitly stated.
-- Each expected_answer must answer the prompt directly and be consistent with starter_code.
-- Prefer exercises that differ from previous_exercises_json while staying within the existing explanation's taught surface area.
-
-Important: if an exercise has code, put that code only in starter_code. The prompt field must contain prose instructions only and must not include markdown code fences."#
+Exercise design rules:
+- Set "difficulty" to exactly "{target_difficulty}".
+- Prefer exercises with observable targets: predict a printed value, satisfy explicit assertions, fill a local expression, implement a stated transformation, or explain a visible code result.
+- Medium exercises should combine at least two taught ideas or require a small transformation.
+- Hard exercises should require multi-step reasoning across the taught ideas, edge cases, invariants, debugging cues, or a nontrivial implementation. They must not be mere API recall.
+- Avoid making the core premise "this fails", "this cannot compile", "this must throw", or "this API is invalid". Use such a premise only when the starter_code is a minimal reproduction and the expected_answer names the exact observable error or repair target.
+- Use FixBug only when the bug is visible in starter_code and the prompt can be answered without relying on hidden requirements.
+- The prompt and expected_answer must be aligned. Hints must not add requirements that are absent from the prompt.
+- Stay inside the explanation/context source of truth. Do not require niche facts that were not taught.
+- This is attempt {attempt} for slot {slot}; avoid patterns already rejected above.
+- Return only valid JSON. Do not wrap JSON in markdown fences."#
     )
 }
 
-pub fn audit_exercises_prompt(
+pub fn validate_one_exercise_prompt(
     concept_json: &str,
     explanation_context: &str,
-    candidate_exercises_json: &str,
+    exercise_json: &str,
+    target_difficulty: &str,
 ) -> String {
     format!(
-        r#"Audit and repair this replacement exercise set before it is shown to the learner.
+        r#"You are the Skeptical Exercise Validator agent.
+
+Task:
+- Validate exactly one exercise.
+- Do not repair it.
+- Do not preserve it for variety.
+- Your output controls whether the program may show this exercise to a learner.
 
 Concept JSON:
 {concept_json}
 
-Existing explanation and follow-up context:
+Explanation/context source of truth:
 {explanation_context}
 
-Candidate exercises JSON:
-{candidate_exercises_json}
+Exercise JSON:
+{exercise_json}
+
+Required difficulty:
+{target_difficulty}
 
 Return JSON with this exact shape:
 {{
-  "audit": [
-    {{
-      "exercise_title": "candidate exercise title",
-      "claim": "the concrete technical claim being checked, for example whether code errors, output value, type/shape change, API effect, compile behavior, or required fix",
-      "verdict": "valid | false | uncertain | unsupported_by_explanation | misaligned",
-      "action": "keep | rewrite | replace"
-    }}
-  ],
-  "exercise_set": {{
-    "exercises": [
-      {{
-        "kind": "FillBlank | FixBug | WriteFromScratch | PredictCompileResult",
-        "title": "exercise title",
-        "prompt": "question in Chinese. Do not repeat starter_code here.",
-        "starter_code": "code or empty string",
-        "expected_answer": "reference answer",
-        "hints": ["hint 1"],
-        "difficulty": "easy | medium | hard"
-      }}
-    ]
-  }}
+  "verdict": "accepted | rejected",
+  "checked_claims": ["specific technical claim checked"],
+  "blocking_issues": ["issue that makes this unsafe to show, or empty if accepted"],
+  "risk_notes": ["non-blocking caveat, or empty"]
 }}
 
-Exercise audit contract:
-- Treat the candidate exercises as untrusted technical claims.
-- For every candidate exercise, write at least one audit item before deciding whether to keep, rewrite, or replace it.
-- A claim is not valid because it appears in the candidate. Validate it against language/library semantics, not against the existing explanation.
-- Keep exactly 4 exercises, but freely rewrite, replace, or reorder flawed exercises.
-- Reject false or uncertain premises. If an exercise claims code fails, compiles, panics, returns a value, changes a type/shape/state, or uses an API effect, that claim must follow from actual language/library semantics. If you cannot verify the claim from reliable knowledge, rewrite the exercise into a safer observation, prediction, construction, or assertion task.
-- Do not preserve FixBug exercises unless the bug is real, specific, and visible from the starter_code and prompt. Otherwise change the kind.
-- Check coverage: every operation or behavior needed by an exercise must be taught in the existing explanation/context. Replace exercises that require untaught facts.
-- Check alignment: hints must not smuggle extra requirements, and expected_answer must match the repaired prompt.
-- If a prompt says "will error", "cannot", "must", or "requires", the audit item must name the exact semantic rule that makes that statement true. If you cannot name that rule confidently, the verdict is uncertain and the exercise must be rewritten or replaced.
-- Do not return or modify explanation/concept/title. Return only the audit and exercise_set fields described above.
-- Return only valid JSON."#
+Validation rules:
+- Reject if the exercise difficulty is not exactly "{target_difficulty}".
+- Reject if a medium or hard exercise is mostly API recall, a single obvious fill-in, or solvable without combining ideas from the explanation/context.
+- For hard exercises, reject unless the exercise requires multi-step reasoning, edge-case analysis, debugging judgement, or a nontrivial implementation while still being fair from the explanation/context.
+- Reject if the prompt, starter_code, hints, or expected_answer contain a factual claim you cannot actively justify from language/library semantics.
+- Reject if the exercise depends on an unstated version, environment, installed package, file system, network, hardware device, or hidden setup.
+- Reject if the prompt says code fails, cannot compile, must throw, or requires a specific repair, unless the starter_code and expected_answer make that premise concrete and self-contained.
+- Reject if expected_answer answers a different question than the prompt asks.
+- Reject if hints smuggle extra requirements.
+- Reject if the exercise requires facts outside the explanation/context source of truth.
+- Accepted means "safe enough to show"; it does not mean perfect.
+- Return only valid JSON. Do not wrap JSON in markdown fences."#
+    )
+}
+
+pub fn review_exercise_gate_prompt(exercise_json: &str) -> String {
+    format!(
+        r#"You are the Review Gate agent.
+
+Task:
+- Before grading a learner, decide whether the exercise itself is safe to grade.
+- Do not grade the learner.
+- Do not repair the exercise.
+
+Exercise JSON:
+{exercise_json}
+
+Return JSON with this exact shape:
+{{
+  "verdict": "accepted | rejected",
+  "checked_claims": ["specific technical claim checked"],
+  "blocking_issues": ["issue that makes this unsafe to grade, or empty if accepted"],
+  "risk_notes": ["non-blocking caveat, or empty"]
+}}
+
+Gate rules:
+- Reject if the exercise premise may be false, ambiguous, underspecified, or environment-dependent.
+- Reject if the prompt, starter_code, hints, and expected_answer are misaligned.
+- Reject if grading would require treating hints as hidden requirements.
+- Accept only if the learner can be graded against the stated prompt without needing unstated assumptions.
+- Return only valid JSON. Do not wrap JSON in markdown fences."#
     )
 }
 
@@ -231,7 +195,6 @@ Learner answer:
 
 Review contract:
 - Be fair, technical, and non-punitive. The exercise is not automatically correct.
-- First audit the exercise premise, starter_code, expected_answer, and hints against actual language/library semantics.
 - If the learner challenges the exercise, evaluate the challenge as a technical answer. A correct challenge to a flawed exercise is correct.
 - If the exercise is false, ambiguous, or more restrictive than its prompt justifies, set is_correct to true, give a high score, explain the flaw in summary, keep mistakes empty or minimal, and provide a corrected exercise or answer in corrected_answer.
 - Hints are not requirements unless the prompt validly makes them requirements.

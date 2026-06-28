@@ -28,6 +28,8 @@ pub enum AiError {
     IncompleteResponse { finish_reason: String },
     #[error("无法解析 AI JSON: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("AI 质量门未通过: {0}")]
+    QualityGateFailed(String),
 }
 
 #[derive(Clone)]
@@ -72,36 +74,23 @@ impl AiClient {
     ) -> Result<ExplainAndGenerateResponse, AiError> {
         let raw = self
             .chat_completion(
-                "explain.generate",
+                "concept.explain",
                 settings,
                 vec![
                     ChatMessageWire::system(prompts::learning_system_prompt()),
-                    ChatMessageWire::user(prompts::explain_and_generate_prompt(topic)),
+                    ChatMessageWire::user(prompts::explain_topic_prompt(topic)),
                 ],
                 true,
             )
             .await?;
-        let parsed: LearningResponseWire = parse_ai_json(&raw)?;
-        let candidate_json = serde_json::to_string_pretty(&parsed)?;
-        let audited_raw = self
-            .chat_completion(
-                "explain.audit",
-                settings,
-                vec![
-                    ChatMessageWire::system(prompts::learning_system_prompt()),
-                    ChatMessageWire::user(prompts::audit_learning_response_prompt(
-                        topic,
-                        &candidate_json,
-                    )),
-                ],
-                true,
-            )
+        let parsed: TopicExplanationWire = parse_ai_json(&raw)?;
+        let concept_json = serde_json::to_string_pretty(&parsed.concept)?;
+        let exercises = self
+            .generate_validated_exercises(settings, &concept_json, &parsed.explanation, None)
             .await?;
-        let parsed: LearningResponseWire =
-            parse_ai_json::<AuditedLearningResponseWire>(&audited_raw)?.learning_response;
         let concept = parsed.concept.into_concept();
         let concept_id = concept.id;
-        let exercises = parsed
+        let exercises = exercises
             .exercises
             .into_iter()
             .map(|exercise| exercise.into_exercise(Some(concept_id)))
@@ -111,7 +100,7 @@ impl AiClient {
             explanation: parsed.explanation,
             concept,
             exercises,
-            raw_response: audited_raw,
+            raw_response: raw,
         })
     }
 
@@ -122,6 +111,34 @@ impl AiClient {
         answer: &str,
     ) -> Result<ReviewResult, AiError> {
         let exercise_json = serde_json::to_string_pretty(exercise)?;
+        let validation_raw = self
+            .chat_completion(
+                "review.exercise_gate",
+                settings,
+                vec![
+                    ChatMessageWire::system(prompts::learning_system_prompt()),
+                    ChatMessageWire::user(prompts::review_exercise_gate_prompt(&exercise_json)),
+                ],
+                true,
+            )
+            .await?;
+        let validation: ExerciseValidationWire = parse_ai_json(&validation_raw)?;
+        if !validation.is_accepted() {
+            return Ok(ReviewResult::new(
+                None,
+                true,
+                100,
+                format!(
+                    "这道题未通过题目前提审查，因此不应按原题扣分。审查结论：{}",
+                    validation.summary()
+                ),
+                validation.blocking_issues,
+                "建议重新生成练习，或把这道题改成可观察输出/显式断言的题目。".to_string(),
+                vec!["重新生成练习后再提交答案。".to_string()],
+                Some(validation_raw),
+            ));
+        }
+
         let raw = self
             .chat_completion(
                 "review",
@@ -146,41 +163,15 @@ impl AiClient {
     ) -> Result<Vec<Exercise>, AiError> {
         let concept_json = serde_json::to_string_pretty(concept)?;
         let previous_exercises_json = serde_json::to_string_pretty(previous_exercises)?;
-        let raw = self
-            .chat_completion(
-                "exercises.regenerate",
+        let exercises = self
+            .generate_validated_exercises(
                 settings,
-                vec![
-                    ChatMessageWire::system(prompts::learning_system_prompt()),
-                    ChatMessageWire::user(prompts::regenerate_exercises_prompt(
-                        &concept_json,
-                        explanation_context,
-                        &previous_exercises_json,
-                    )),
-                ],
-                true,
+                &concept_json,
+                explanation_context,
+                Some(&previous_exercises_json),
             )
             .await?;
-        let parsed: ExerciseSetWire = parse_ai_json(&raw)?;
-        let candidate_exercises_json = serde_json::to_string_pretty(&parsed)?;
-        let audited_raw = self
-            .chat_completion(
-                "exercises.audit",
-                settings,
-                vec![
-                    ChatMessageWire::system(prompts::learning_system_prompt()),
-                    ChatMessageWire::user(prompts::audit_exercises_prompt(
-                        &concept_json,
-                        explanation_context,
-                        &candidate_exercises_json,
-                    )),
-                ],
-                true,
-            )
-            .await?;
-        let parsed: ExerciseSetWire =
-            parse_ai_json::<AuditedExerciseSetWire>(&audited_raw)?.exercise_set;
-        Ok(parsed
+        Ok(exercises
             .exercises
             .into_iter()
             .map(|exercise| exercise.into_exercise(Some(concept.id)))
@@ -236,6 +227,91 @@ impl AiClient {
         Ok(ExperimentPrompt::new(parsed.title, parsed.prompt))
     }
 
+    async fn generate_validated_exercises(
+        &self,
+        settings: &ApiSettings,
+        concept_json: &str,
+        explanation_context: &str,
+        previous_exercises_json: Option<&str>,
+    ) -> Result<ExerciseSetWire, AiError> {
+        const MAX_ATTEMPTS_PER_SLOT: usize = 3;
+        const DIFFICULTY_PLAN: [&str; 4] = ["easy", "medium", "hard", "hard"];
+
+        let mut accepted = Vec::new();
+        let mut rejected: Vec<RejectedExerciseWire> = Vec::new();
+
+        while accepted.len() < DIFFICULTY_PLAN.len() {
+            let slot = accepted.len() + 1;
+            let target_difficulty = DIFFICULTY_PLAN[slot - 1];
+            let mut accepted_this_slot = false;
+
+            for attempt in 1..=MAX_ATTEMPTS_PER_SLOT {
+                let accepted_json = serde_json::to_string_pretty(&accepted)?;
+                let rejected_json = serde_json::to_string_pretty(&rejected)?;
+                let raw = self
+                    .chat_completion(
+                        "exercise.generate_one",
+                        settings,
+                        vec![
+                            ChatMessageWire::system(prompts::learning_system_prompt()),
+                            ChatMessageWire::user(prompts::generate_one_exercise_prompt(
+                                concept_json,
+                                explanation_context,
+                                previous_exercises_json,
+                                &accepted_json,
+                                &rejected_json,
+                                slot,
+                                target_difficulty,
+                                attempt,
+                            )),
+                        ],
+                        true,
+                    )
+                    .await?;
+                let exercise: ExerciseWire = parse_ai_json(&raw)?;
+                let exercise_json = serde_json::to_string_pretty(&exercise)?;
+                let validation_raw = self
+                    .chat_completion(
+                        "exercise.validate_one",
+                        settings,
+                        vec![
+                            ChatMessageWire::system(prompts::learning_system_prompt()),
+                            ChatMessageWire::user(prompts::validate_one_exercise_prompt(
+                                concept_json,
+                                explanation_context,
+                                &exercise_json,
+                                target_difficulty,
+                            )),
+                        ],
+                        true,
+                    )
+                    .await?;
+                let validation: ExerciseValidationWire = parse_ai_json(&validation_raw)?;
+
+                if validation.is_accepted() {
+                    accepted.push(exercise);
+                    accepted_this_slot = true;
+                    break;
+                }
+
+                rejected.push(RejectedExerciseWire {
+                    exercise,
+                    validation,
+                });
+            }
+
+            if !accepted_this_slot {
+                return Err(AiError::QualityGateFailed(format!(
+                    "第 {slot} 道练习连续 {MAX_ATTEMPTS_PER_SLOT} 次未通过独立题目前提审查，已停止展示可疑题目"
+                )));
+            }
+        }
+
+        Ok(ExerciseSetWire {
+            exercises: accepted,
+        })
+    }
+
     async fn chat_completion(
         &self,
         label: &str,
@@ -257,13 +333,14 @@ impl AiClient {
 
         if deepseek_thinking {
             payload["thinking"] = json!({ "type": "enabled" });
-            payload["reasoning_effort"] = json!("max");
+            payload["reasoning_effort"] = json!("high");
         } else {
             payload["temperature"] = json!(0.2);
         }
 
         if json_response {
             payload["response_format"] = json!({ "type": "json_object" });
+            payload["max_tokens"] = json!(8192);
         }
 
         log_ai_request(label, &payload);
@@ -576,19 +653,11 @@ struct ChatMessageContent {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct LearningResponseWire {
+struct TopicExplanationWire {
     #[serde(default)]
     topic_title: Option<String>,
     explanation: String,
     concept: ConceptWire,
-    exercises: Vec<ExerciseWire>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AuditedLearningResponseWire {
-    #[allow(dead_code)]
-    audit: Vec<ExerciseAuditWire>,
-    learning_response: LearningResponseWire,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -605,7 +674,7 @@ impl ConceptWire {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ExerciseWire {
     kind: ExerciseKind,
     title: String,
@@ -621,23 +690,31 @@ struct ExerciseSetWire {
     exercises: Vec<ExerciseWire>,
 }
 
-#[derive(Debug, Deserialize)]
-struct AuditedExerciseSetWire {
-    #[allow(dead_code)]
-    audit: Vec<ExerciseAuditWire>,
-    exercise_set: ExerciseSetWire,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExerciseValidationWire {
+    verdict: String,
+    checked_claims: Vec<String>,
+    blocking_issues: Vec<String>,
+    risk_notes: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ExerciseAuditWire {
-    #[allow(dead_code)]
-    exercise_title: String,
-    #[allow(dead_code)]
-    claim: String,
-    #[allow(dead_code)]
-    verdict: String,
-    #[allow(dead_code)]
-    action: String,
+impl ExerciseValidationWire {
+    fn is_accepted(&self) -> bool {
+        self.verdict.trim().eq_ignore_ascii_case("accepted")
+    }
+
+    fn summary(&self) -> String {
+        if self.blocking_issues.is_empty() {
+            return self.verdict.clone();
+        }
+        self.blocking_issues.join("；")
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RejectedExerciseWire {
+    exercise: ExerciseWire,
+    validation: ExerciseValidationWire,
 }
 
 impl ExerciseWire {

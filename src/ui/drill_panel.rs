@@ -1,13 +1,13 @@
 use crate::app::{
     regenerate_exercises, request_experiment, select_exercise, submit_answer, update_answer_input,
-    AppState,
+    APP_STATE,
 };
 use dioxus::prelude::*;
 
 #[component]
 #[allow(non_snake_case)]
-pub fn DrillPanel(state: Signal<AppState>) -> Element {
-    let snapshot = state.read().clone();
+pub fn DrillPanel() -> Element {
+    let snapshot = APP_STATE.read().clone();
     let topic = snapshot.active_topic().cloned();
 
     rsx! {
@@ -44,7 +44,7 @@ pub fn DrillPanel(state: Signal<AppState>) -> Element {
                                 rsx! {
                                     button {
                                         class: "{class_name}",
-                                        onclick: move |_| select_exercise(state, exercise_id),
+                                        onclick: move |_| select_exercise(exercise_id),
                                         "{exercise.kind.label()}"
                                     }
                                 }
@@ -55,7 +55,7 @@ pub fn DrillPanel(state: Signal<AppState>) -> Element {
                         div { class: "composer-row",
                             button {
                                 disabled: snapshot.is_busy(),
-                                onclick: move |_| regenerate_exercises(state),
+                                onclick: move |_| regenerate_exercises(),
                                 "重新生成练习"
                             }
                         }
@@ -97,18 +97,18 @@ pub fn DrillPanel(state: Signal<AppState>) -> Element {
                             autocapitalize: "off",
                             translate: "no",
                             wrap: "off",
-                            oninput: move |event| update_answer_input(state, event.value())
+                            oninput: move |event| update_answer_input(event.value())
                         }
                         div { class: "composer-row",
                             button {
                                 disabled: snapshot.is_busy(),
-                                onclick: move |_| request_experiment(state),
+                                onclick: move |_| request_experiment(),
                                 "请求实验"
                             }
                             button {
                                 class: "primary",
                                 disabled: snapshot.is_busy(),
-                                onclick: move |_| submit_answer(state),
+                                onclick: move |_| submit_answer(),
                                 "提交答案"
                             }
                         }

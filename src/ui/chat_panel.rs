@@ -1,7 +1,7 @@
 use crate::app::{
     begin_rename_topic, cancel_rename_topic, commit_rename_topic, delete_topic,
     follow_up_from_chat_input, generate_from_chat_input, new_topic, regenerate_from_topic,
-    set_topic_sort, switch_topic, update_chat_input, update_rename_input, AppState, ChatRole,
+    set_topic_sort, switch_topic, update_chat_input, update_rename_input, APP_STATE, ChatRole,
     TopicSort,
 };
 use dioxus::prelude::*;
@@ -9,8 +9,8 @@ use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Par
 
 #[component]
 #[allow(non_snake_case)]
-pub fn ChatPanel(state: Signal<AppState>) -> Element {
-    let snapshot = state.read().clone();
+pub fn ChatPanel() -> Element {
+    let snapshot = APP_STATE.read().clone();
     let active_id = snapshot.active_topic_id;
     let topics = snapshot.sorted_topics();
     let has_learning_content = snapshot
@@ -40,12 +40,12 @@ pub fn ChatPanel(state: Signal<AppState>) -> Element {
                 div { class: "composer-row",
                     button {
                         class: "primary",
-                        onclick: move |_| new_topic(state),
+                        onclick: move |_| new_topic(),
                         "开新话题"
                     }
                     select {
                         value: "{sort_value(snapshot.topic_sort)}",
-                        onchange: move |event| set_topic_sort(state, sort_from_value(&event.value())),
+                        onchange: move |event| set_topic_sort(sort_from_value(&event.value())),
                         option {
                             value: "updated",
                             selected: snapshot.topic_sort == TopicSort::UpdatedDesc,
@@ -78,16 +78,16 @@ pub fn ChatPanel(state: Signal<AppState>) -> Element {
                                 div { class: "topic-rename",
                                     input {
                                         value: "{snapshot.rename_input}",
-                                        oninput: move |event| update_rename_input(state, event.value())
+                                        oninput: move |event| update_rename_input(event.value())
                                     }
                                     button {
                                         class: "topic-tool",
-                                        onclick: move |_| commit_rename_topic(state),
+                                        onclick: move |_| commit_rename_topic(),
                                         "保存"
                                     }
                                     button {
                                         class: "topic-tool",
-                                        onclick: move |_| cancel_rename_topic(state),
+                                        onclick: move |_| cancel_rename_topic(),
                                         "取消"
                                     }
                                 }
@@ -97,20 +97,20 @@ pub fn ChatPanel(state: Signal<AppState>) -> Element {
                                 div { class: "topic-item",
                                     button {
                                         class: "{open_class}",
-                                        onclick: move |_| switch_topic(state, topic_id),
+                                        onclick: move |_| switch_topic(topic_id),
                                         span { class: "topic-title", "{topic.title}" }
                                         span { class: "topic-meta", "{updated_at}" }
                                     }
                                     button {
                                         class: "topic-tool",
                                         title: "重命名",
-                                        onclick: move |_| begin_rename_topic(state, topic_id),
+                                        onclick: move |_| begin_rename_topic(topic_id),
                                         "改"
                                     }
                                     button {
                                         class: "topic-tool",
                                         title: "删除",
-                                        onclick: move |_| delete_topic(state, topic_id),
+                                        onclick: move |_| delete_topic(topic_id),
                                         "删"
                                     }
                                 }
@@ -149,13 +149,13 @@ pub fn ChatPanel(state: Signal<AppState>) -> Element {
                 textarea {
                     value: "{snapshot.chat_input}",
                     placeholder: "{chat_placeholder}",
-                    oninput: move |event| update_chat_input(state, event.value())
+                    oninput: move |event| update_chat_input(event.value())
                 }
                 div { class: "composer-row",
                     if has_learning_content {
                         button {
                             disabled: snapshot.is_busy(),
-                            onclick: move |_| regenerate_from_topic(state),
+                            onclick: move |_| regenerate_from_topic(),
                             "重新生成练习"
                         }
                     }
@@ -163,14 +163,14 @@ pub fn ChatPanel(state: Signal<AppState>) -> Element {
                         button {
                             class: "primary",
                             disabled: snapshot.is_busy(),
-                            onclick: move |_| follow_up_from_chat_input(state),
+                            onclick: move |_| follow_up_from_chat_input(),
                             "{send_label}"
                         }
                     } else {
                         button {
                             class: "primary",
                             disabled: snapshot.is_busy(),
-                            onclick: move |_| generate_from_chat_input(state),
+                            onclick: move |_| generate_from_chat_input(),
                             "{send_label}"
                         }
                     }

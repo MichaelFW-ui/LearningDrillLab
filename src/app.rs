@@ -12,6 +12,8 @@ use std::fs;
 use std::path::PathBuf;
 use uuid::Uuid;
 
+pub(crate) static APP_STATE: GlobalSignal<AppState> = Signal::global(AppState::load);
+
 const APP_CSS: &str = r#"
 :root {
   color: #202225;
@@ -422,8 +424,7 @@ document.addEventListener("keydown", function(event) {
 
 #[allow(non_snake_case)]
 pub fn App() -> Element {
-    let state = use_signal(AppState::load);
-    let snapshot = state.read().clone();
+    let snapshot = APP_STATE.read().clone();
 
     rsx! {
         style { "{APP_CSS}" }
@@ -437,12 +438,12 @@ pub fn App() -> Element {
                 div { class: "top-actions",
                     button {
                         class: "ghost",
-                        onclick: move |_| set_view(state, AppView::Workspace),
+                        onclick: move |_| set_view(AppView::Workspace),
                         "工作台"
                     }
                     button {
                         class: "ghost",
-                        onclick: move |_| set_view(state, AppView::Settings),
+                        onclick: move |_| set_view(AppView::Settings),
                         "设置"
                     }
                 }
@@ -457,11 +458,11 @@ pub fn App() -> Element {
             }
 
             if snapshot.view == AppView::Settings {
-                SettingsPage { state }
+                SettingsPage {}
             } else {
                 div { class: "workspace",
-                    ChatPanel { state }
-                    DrillPanel { state }
+                    ChatPanel {}
+                    DrillPanel {}
                 }
             }
         }
@@ -470,8 +471,8 @@ pub fn App() -> Element {
 
 #[component]
 #[allow(non_snake_case)]
-fn SettingsPage(state: Signal<AppState>) -> Element {
-    let snapshot = state.read().clone();
+fn SettingsPage() -> Element {
+    let snapshot = APP_STATE.read().clone();
     let selected_model = snapshot.settings.selected_model.clone();
 
     rsx! {
@@ -486,19 +487,19 @@ fn SettingsPage(state: Signal<AppState>) -> Element {
                     input {
                         value: "{snapshot.settings.base_url}",
                         placeholder: "https://api.openai.com/v1",
-                        oninput: move |event| update_base_url(state, event.value())
+                        oninput: move |event| update_base_url(event.value())
                     }
                     label { "API Key" }
                     input {
                         r#type: "password",
                         value: "{snapshot.settings.api_key}",
                         placeholder: "sk-...",
-                        oninput: move |event| update_api_key(state, event.value())
+                        oninput: move |event| update_api_key(event.value())
                     }
                     label { "模型" }
                     select {
                         value: "{selected_model}",
-                        onchange: move |event| select_model(state, event.value()),
+                        onchange: move |event| select_model(event.value()),
                         if snapshot.settings.available_models.is_empty() {
                             option { value: "", "请先拉取模型列表" }
                         }
@@ -513,13 +514,13 @@ fn SettingsPage(state: Signal<AppState>) -> Element {
                 }
                 div { class: "form-actions",
                     button {
-                        onclick: move |_| fetch_models(state),
+                        onclick: move |_| fetch_models(),
                         disabled: snapshot.is_busy(),
                         "拉取模型列表"
                     }
                     button {
                         class: "primary",
-                        onclick: move |_| save_settings(state),
+                        onclick: move |_| save_settings(),
                         "保存设置"
                     }
                 }
@@ -785,49 +786,49 @@ impl AppState {
     }
 }
 
-pub fn set_view(mut state: Signal<AppState>, view: AppView) {
-    state.write().view = view;
+pub fn set_view(view: AppView) {
+    APP_STATE.write().view = view;
 }
 
-pub fn update_chat_input(mut state: Signal<AppState>, value: String) {
-    state.write().chat_input = value;
+pub fn update_chat_input(value: String) {
+    APP_STATE.write().chat_input = value;
 }
 
-pub fn update_answer_input(mut state: Signal<AppState>, value: String) {
-    state.write().answer_input = value;
+pub fn update_answer_input(value: String) {
+    APP_STATE.write().answer_input = value;
 }
 
-pub fn update_base_url(mut state: Signal<AppState>, value: String) {
-    state.write().settings.base_url = value;
+pub fn update_base_url(value: String) {
+    APP_STATE.write().settings.base_url = value;
 }
 
-pub fn update_api_key(mut state: Signal<AppState>, value: String) {
-    state.write().settings.api_key = value;
+pub fn update_api_key(value: String) {
+    APP_STATE.write().settings.api_key = value;
 }
 
-pub fn select_model(mut state: Signal<AppState>, value: String) {
+pub fn select_model(value: String) {
     {
-        let mut app = state.write();
+        let mut app = APP_STATE.write();
         app.settings.selected_model = value;
         app.status = Some("已选择模型".to_string());
         app.error = None;
     }
-    persist_signal(state);
+    persist_signal();
 }
 
-pub fn set_topic_sort(mut state: Signal<AppState>, sort: TopicSort) {
+pub fn set_topic_sort(sort: TopicSort) {
     {
-        let mut app = state.write();
+        let mut app = APP_STATE.write();
         app.topic_sort = sort;
         app.status = Some(format!("历史话题已按{}排序", sort.label()));
         app.error = None;
     }
-    persist_signal(state);
+    persist_signal();
 }
 
-pub fn save_settings(mut state: Signal<AppState>) {
+pub fn save_settings() {
     {
-        let mut app = state.write();
+        let mut app = APP_STATE.write();
         app.settings.base_url = app
             .settings
             .base_url
@@ -837,12 +838,12 @@ pub fn save_settings(mut state: Signal<AppState>) {
         app.status = Some("设置已保存到本地".to_string());
         app.error = None;
     }
-    persist_signal(state);
+    persist_signal();
 }
 
-pub fn fetch_models(mut state: Signal<AppState>) {
+pub fn fetch_models() {
     let settings = {
-        let mut app = state.write();
+        let mut app = APP_STATE.write();
         app.settings.base_url = app
             .settings
             .base_url
@@ -859,7 +860,7 @@ pub fn fetch_models(mut state: Signal<AppState>) {
         let result = AiClient::default().fetch_models(&settings).await;
         match result {
             Ok(models) => {
-                let mut app = state.write();
+                let mut app = APP_STATE.write();
                 app.loading = None;
                 if models.is_empty() {
                     app.error = Some("模型列表为空，请检查 Base URL 或 API Key".to_string());
@@ -880,18 +881,18 @@ pub fn fetch_models(mut state: Signal<AppState>) {
                 }
             }
             Err(error) => {
-                let mut app = state.write();
+                let mut app = APP_STATE.write();
                 app.loading = None;
                 app.error = Some(error.to_string());
             }
         }
-        persist_signal(state);
+        persist_signal();
     });
 }
 
-pub fn new_topic(mut state: Signal<AppState>) {
+pub fn new_topic() {
     {
-        let mut app = state.write();
+        let mut app = APP_STATE.write();
         let topic = TopicSession::new();
         app.active_topic_id = Some(topic.id);
         app.topics.insert(0, topic);
@@ -902,12 +903,12 @@ pub fn new_topic(mut state: Signal<AppState>) {
         app.error = None;
         app.status = Some("已创建新话题".to_string());
     }
-    persist_signal(state);
+    persist_signal();
 }
 
-pub fn switch_topic(mut state: Signal<AppState>, topic_id: Uuid) {
+pub fn switch_topic(topic_id: Uuid) {
     {
-        let mut app = state.write();
+        let mut app = APP_STATE.write();
         app.active_topic_id = Some(topic_id);
         app.chat_input.clear();
         app.answer_input.clear();
@@ -916,12 +917,12 @@ pub fn switch_topic(mut state: Signal<AppState>, topic_id: Uuid) {
         app.error = None;
         app.status = Some("已切换历史话题".to_string());
     }
-    persist_signal(state);
+    persist_signal();
 }
 
-pub fn delete_topic(mut state: Signal<AppState>, topic_id: Uuid) {
+pub fn delete_topic(topic_id: Uuid) {
     {
-        let mut app = state.write();
+        let mut app = APP_STATE.write();
         app.topics.retain(|topic| topic.id != topic_id);
         if app.active_topic_id == Some(topic_id) {
             app.active_topic_id = app.topics.first().map(|topic| topic.id);
@@ -934,12 +935,12 @@ pub fn delete_topic(mut state: Signal<AppState>, topic_id: Uuid) {
         app.error = None;
         app.status = Some("已删除历史话题".to_string());
     }
-    persist_signal(state);
+    persist_signal();
 }
 
-pub fn begin_rename_topic(mut state: Signal<AppState>, topic_id: Uuid) {
+pub fn begin_rename_topic(topic_id: Uuid) {
     let title = {
-        let app = state.read();
+        let app = APP_STATE.read();
         app.topics
             .iter()
             .find(|topic| topic.id == topic_id)
@@ -947,26 +948,26 @@ pub fn begin_rename_topic(mut state: Signal<AppState>, topic_id: Uuid) {
     };
 
     if let Some(title) = title {
-        let mut app = state.write();
+        let mut app = APP_STATE.write();
         app.renaming_topic_id = Some(topic_id);
         app.rename_input = title;
         app.error = None;
     }
 }
 
-pub fn update_rename_input(mut state: Signal<AppState>, value: String) {
-    state.write().rename_input = value;
+pub fn update_rename_input(value: String) {
+    APP_STATE.write().rename_input = value;
 }
 
-pub fn cancel_rename_topic(mut state: Signal<AppState>) {
-    let mut app = state.write();
+pub fn cancel_rename_topic() {
+    let mut app = APP_STATE.write();
     app.renaming_topic_id = None;
     app.rename_input.clear();
 }
 
-pub fn commit_rename_topic(mut state: Signal<AppState>) {
+pub fn commit_rename_topic() {
     {
-        let mut app = state.write();
+        let mut app = APP_STATE.write();
         let Some(topic_id) = app.renaming_topic_id else {
             return;
         };
@@ -984,12 +985,12 @@ pub fn commit_rename_topic(mut state: Signal<AppState>) {
         app.error = None;
         app.status = Some("话题已重命名".to_string());
     }
-    persist_signal(state);
+    persist_signal();
 }
 
-pub fn select_exercise(mut state: Signal<AppState>, exercise_id: Uuid) {
+pub fn select_exercise(exercise_id: Uuid) {
     {
-        let mut app = state.write();
+        let mut app = APP_STATE.write();
         if let Some(topic) = app.active_topic_mut() {
             topic.selected_exercise_id = Some(exercise_id);
             topic.updated_at = Utc::now();
@@ -997,20 +998,20 @@ pub fn select_exercise(mut state: Signal<AppState>, exercise_id: Uuid) {
         app.answer_input.clear();
         app.error = None;
     }
-    persist_signal(state);
+    persist_signal();
 }
 
-pub fn generate_from_chat_input(state: Signal<AppState>) {
-    start_learning_generation(state);
+pub fn generate_from_chat_input() {
+    start_learning_generation();
 }
 
-pub fn follow_up_from_chat_input(state: Signal<AppState>) {
-    send_follow_up_request(state);
+pub fn follow_up_from_chat_input() {
+    send_follow_up_request();
 }
 
-pub fn regenerate_from_topic(mut state: Signal<AppState>) {
+pub fn regenerate_from_topic() {
     let (topic_id, settings, concept, explanation_context, previous_exercises) = {
-        let mut app = state.write();
+        let mut app = APP_STATE.write();
         let settings = app.settings.clone();
         let Some(topic) = app.active_topic() else {
             app.error = Some("当前没有可用话题".to_string());
@@ -1029,7 +1030,7 @@ pub fn regenerate_from_topic(mut state: Signal<AppState>) {
         let previous_exercises = topic.exercises.clone();
 
         app.answer_input.clear();
-        app.loading = Some("AI 正在基于当前讲解重新生成练习...".to_string());
+        app.loading = Some("AI 正在基于当前讲解分步生成并审查练习...".to_string());
         app.error = None;
         app.status = None;
 
@@ -1041,7 +1042,7 @@ pub fn regenerate_from_topic(mut state: Signal<AppState>) {
             previous_exercises,
         )
     };
-    persist_signal(state);
+    persist_signal();
 
     spawn_forever(async move {
         let result = AiClient::default()
@@ -1054,7 +1055,7 @@ pub fn regenerate_from_topic(mut state: Signal<AppState>) {
             .await;
         match result {
             Ok(exercises) => {
-                let mut app = state.write();
+                let mut app = APP_STATE.write();
                 if let Some(topic) = app.topic_mut(topic_id) {
                     topic.exercises = exercises;
                     topic.selected_exercise_id =
@@ -1068,18 +1069,18 @@ pub fn regenerate_from_topic(mut state: Signal<AppState>) {
                 app.error = None;
             }
             Err(error) => {
-                let mut app = state.write();
+                let mut app = APP_STATE.write();
                 app.loading = None;
                 app.error = Some(error.to_string());
             }
         }
-        persist_signal(state);
+        persist_signal();
     });
 }
 
-fn start_learning_generation(mut state: Signal<AppState>) {
+fn start_learning_generation() {
     let (topic_id, topic_text, settings) = {
-        let mut app = state.write();
+        let mut app = APP_STATE.write();
         app.ensure_active_topic();
 
         let topic_text = app.chat_input.trim().to_string();
@@ -1100,12 +1101,12 @@ fn start_learning_generation(mut state: Signal<AppState>) {
 
         app.chat_input.clear();
         app.answer_input.clear();
-        app.loading = Some("AI 正在讲解、审题并生成练习...".to_string());
+        app.loading = Some("AI 正在分步讲解、生成并审查练习...".to_string());
         app.error = None;
         app.status = None;
         (active_topic_id, topic_text, settings)
     };
-    persist_signal(state);
+    persist_signal();
 
     spawn_forever(async move {
         let result = AiClient::default()
@@ -1113,7 +1114,7 @@ fn start_learning_generation(mut state: Signal<AppState>) {
             .await;
         match result {
             Ok(response) => {
-                let mut app = state.write();
+                let mut app = APP_STATE.write();
                 if let Some(topic) = app.topic_mut(topic_id) {
                     if let Some(title) =
                         normalized_title(response.topic_title.as_deref(), &response.concept.title)
@@ -1137,7 +1138,7 @@ fn start_learning_generation(mut state: Signal<AppState>) {
                 app.error = None;
             }
             Err(error) => {
-                let mut app = state.write();
+                let mut app = APP_STATE.write();
                 app.loading = None;
                 app.error = Some(error.to_string());
                 if let Some(topic) = app.topic_mut(topic_id) {
@@ -1151,7 +1152,7 @@ fn start_learning_generation(mut state: Signal<AppState>) {
                 }
             }
         }
-        persist_signal(state);
+        persist_signal();
     });
 }
 
@@ -1167,9 +1168,9 @@ fn explanation_context_for_topic(topic: &TopicSession) -> String {
         .join("\n\n---\n\n")
 }
 
-fn send_follow_up_request(mut state: Signal<AppState>) {
+fn send_follow_up_request() {
     let (topic_id, settings, messages, concept_json, exercises_json, attempts_json) = {
-        let mut app = state.write();
+        let mut app = APP_STATE.write();
         let question = app.chat_input.trim().to_string();
         if question.is_empty() {
             app.error = Some("请输入追问内容".to_string());
@@ -1206,7 +1207,7 @@ fn send_follow_up_request(mut state: Signal<AppState>) {
             attempts_json,
         )
     };
-    persist_signal(state);
+    persist_signal();
 
     spawn_forever(async move {
         let result = AiClient::default()
@@ -1220,7 +1221,7 @@ fn send_follow_up_request(mut state: Signal<AppState>) {
             .await;
         match result {
             Ok(answer) => {
-                let mut app = state.write();
+                let mut app = APP_STATE.write();
                 if let Some(topic) = app.topic_mut(topic_id) {
                     topic
                         .messages
@@ -1232,7 +1233,7 @@ fn send_follow_up_request(mut state: Signal<AppState>) {
                 app.error = None;
             }
             Err(error) => {
-                let mut app = state.write();
+                let mut app = APP_STATE.write();
                 app.loading = None;
                 app.error = Some(error.to_string());
                 if let Some(topic) = app.topic_mut(topic_id) {
@@ -1243,13 +1244,13 @@ fn send_follow_up_request(mut state: Signal<AppState>) {
                 }
             }
         }
-        persist_signal(state);
+        persist_signal();
     });
 }
 
-pub fn submit_answer(mut state: Signal<AppState>) {
+pub fn submit_answer() {
     let (topic_id, settings, exercise, answer) = {
-        let mut app = state.write();
+        let mut app = APP_STATE.write();
         let answer = app.answer_input.trim().to_string();
         if answer.is_empty() {
             app.error = Some("请输入答案后再提交".to_string());
@@ -1280,7 +1281,7 @@ pub fn submit_answer(mut state: Signal<AppState>) {
                 review.attempt_id = Some(attempt.id);
                 attempt.review = Some(review);
 
-                let mut app = state.write();
+                let mut app = APP_STATE.write();
                 if let Some(topic) = app.topic_mut(topic_id) {
                     topic.attempts.push(attempt);
                     topic.updated_at = Utc::now();
@@ -1291,18 +1292,18 @@ pub fn submit_answer(mut state: Signal<AppState>) {
                 app.error = None;
             }
             Err(error) => {
-                let mut app = state.write();
+                let mut app = APP_STATE.write();
                 app.loading = None;
                 app.error = Some(error.to_string());
             }
         }
-        persist_signal(state);
+        persist_signal();
     });
 }
 
-pub fn request_experiment(mut state: Signal<AppState>) {
+pub fn request_experiment() {
     let (topic_id, settings, concept, exercise) = {
-        let mut app = state.write();
+        let mut app = APP_STATE.write();
         let Some(topic) = app.active_topic() else {
             app.error = Some("当前没有可用话题".to_string());
             return;
@@ -1328,7 +1329,7 @@ pub fn request_experiment(mut state: Signal<AppState>) {
             .await;
         match result {
             Ok(prompt) => {
-                let mut app = state.write();
+                let mut app = APP_STATE.write();
                 if let Some(topic) = app.topic_mut(topic_id) {
                     topic.experiment_prompts.push(prompt);
                     topic.updated_at = Utc::now();
@@ -1338,23 +1339,23 @@ pub fn request_experiment(mut state: Signal<AppState>) {
                 app.error = None;
             }
             Err(error) => {
-                let mut app = state.write();
+                let mut app = APP_STATE.write();
                 app.loading = None;
                 app.error = Some(error.to_string());
             }
         }
-        persist_signal(state);
+        persist_signal();
     });
 }
 
-pub fn regenerate_exercises(state: Signal<AppState>) {
-    regenerate_from_topic(state);
+pub fn regenerate_exercises() {
+    regenerate_from_topic();
 }
 
-pub fn persist_signal(mut state: Signal<AppState>) {
-    let snapshot = state.read().clone();
+pub fn persist_signal() {
+    let snapshot = APP_STATE.read().clone();
     if let Err(error) = snapshot.save() {
-        state.write().error = Some(format!("保存本地历史失败：{error}"));
+        APP_STATE.write().error = Some(format!("保存本地历史失败：{error}"));
     }
 }
 
