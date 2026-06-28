@@ -1,0 +1,5 @@
+/target/
+/.local/
+/config.local.json
+/*.local.json
+.DS_Store
