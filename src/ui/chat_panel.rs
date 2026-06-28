@@ -1,7 +1,8 @@
 use crate::app::{
-    begin_rename_topic, cancel_rename_topic, commit_rename_topic, delete_topic, new_topic,
-    send_learning_request, set_topic_sort, switch_topic, update_chat_input, update_rename_input,
-    AppState, ChatRole, TopicSort,
+    begin_rename_topic, cancel_rename_topic, commit_rename_topic, delete_topic,
+    follow_up_from_chat_input, generate_from_chat_input, new_topic, regenerate_from_topic,
+    set_topic_sort, switch_topic, update_chat_input, update_rename_input, AppState, ChatRole,
+    TopicSort,
 };
 use dioxus::prelude::*;
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag};
@@ -12,6 +13,26 @@ pub fn ChatPanel(state: Signal<AppState>) -> Element {
     let snapshot = state.read().clone();
     let active_id = snapshot.active_topic_id;
     let topics = snapshot.sorted_topics();
+    let has_learning_content = snapshot
+        .active_topic()
+        .map(|topic| {
+            topic.concept.is_some()
+                || !topic.exercises.is_empty()
+                || topic.messages.iter().any(|message| {
+                    message.role == ChatRole::Assistant && message.raw_response.is_some()
+                })
+        })
+        .unwrap_or(false);
+    let chat_placeholder = if has_learning_content {
+        "追问或质疑当前讲解..."
+    } else {
+        "输入想学习的知识点..."
+    };
+    let send_label = if has_learning_content {
+        "追问"
+    } else {
+        "生成练习"
+    };
 
     rsx! {
         div { class: "chat-panel",
@@ -127,15 +148,31 @@ pub fn ChatPanel(state: Signal<AppState>) -> Element {
             div { class: "composer",
                 textarea {
                     value: "{snapshot.chat_input}",
-                    placeholder: "输入想学习的知识点...",
+                    placeholder: "{chat_placeholder}",
                     oninput: move |event| update_chat_input(state, event.value())
                 }
                 div { class: "composer-row",
-                    button {
-                        class: "primary",
-                        disabled: snapshot.is_busy(),
-                        onclick: move |_| send_learning_request(state),
-                        "发送"
+                    if has_learning_content {
+                        button {
+                            disabled: snapshot.is_busy(),
+                            onclick: move |_| regenerate_from_topic(state),
+                            "重新生成练习"
+                        }
+                    }
+                    if has_learning_content {
+                        button {
+                            class: "primary",
+                            disabled: snapshot.is_busy(),
+                            onclick: move |_| follow_up_from_chat_input(state),
+                            "{send_label}"
+                        }
+                    } else {
+                        button {
+                            class: "primary",
+                            disabled: snapshot.is_busy(),
+                            onclick: move |_| generate_from_chat_input(state),
+                            "{send_label}"
+                        }
                     }
                 }
             }

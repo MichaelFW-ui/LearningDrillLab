@@ -1000,17 +1000,97 @@ pub fn select_exercise(mut state: Signal<AppState>, exercise_id: Uuid) {
     persist_signal(state);
 }
 
-pub fn send_learning_request(mut state: Signal<AppState>) {
+pub fn generate_from_chat_input(state: Signal<AppState>) {
+    start_learning_generation(state);
+}
+
+pub fn follow_up_from_chat_input(state: Signal<AppState>) {
+    send_follow_up_request(state);
+}
+
+pub fn regenerate_from_topic(mut state: Signal<AppState>) {
+    let (topic_id, settings, concept, explanation_context, previous_exercises) = {
+        let mut app = state.write();
+        let settings = app.settings.clone();
+        let Some(topic) = app.active_topic() else {
+            app.error = Some("当前没有可用话题".to_string());
+            return;
+        };
+        let Some(concept) = topic.concept.clone() else {
+            app.error = Some("请先生成讲解，再重新生成练习".to_string());
+            return;
+        };
+        let explanation_context = explanation_context_for_topic(topic);
+        if explanation_context.trim().is_empty() {
+            app.error = Some("当前话题缺少可用于出题的讲解上下文".to_string());
+            return;
+        }
+        let topic_id = topic.id;
+        let previous_exercises = topic.exercises.clone();
+
+        app.answer_input.clear();
+        app.loading = Some("AI 正在基于当前讲解重新生成练习...".to_string());
+        app.error = None;
+        app.status = None;
+
+        (
+            topic_id,
+            settings,
+            concept,
+            explanation_context,
+            previous_exercises,
+        )
+    };
+    persist_signal(state);
+
+    spawn_forever(async move {
+        let result = AiClient::default()
+            .regenerate_exercises(
+                &settings,
+                &concept,
+                &explanation_context,
+                &previous_exercises,
+            )
+            .await;
+        match result {
+            Ok(exercises) => {
+                let mut app = state.write();
+                if let Some(topic) = app.topic_mut(topic_id) {
+                    topic.exercises = exercises;
+                    topic.selected_exercise_id =
+                        topic.exercises.first().map(|exercise| exercise.id);
+                    topic.attempts.clear();
+                    topic.experiment_prompts.clear();
+                    topic.updated_at = Utc::now();
+                }
+                app.loading = None;
+                app.status = Some("已基于当前讲解重新生成练习".to_string());
+                app.error = None;
+            }
+            Err(error) => {
+                let mut app = state.write();
+                app.loading = None;
+                app.error = Some(error.to_string());
+            }
+        }
+        persist_signal(state);
+    });
+}
+
+fn start_learning_generation(mut state: Signal<AppState>) {
     let (topic_id, topic_text, settings) = {
         let mut app = state.write();
+        app.ensure_active_topic();
+
         let topic_text = app.chat_input.trim().to_string();
-        if topic_text.is_empty() {
+
+        if topic_text.trim().is_empty() {
             app.error = Some("请输入想学习的知识点".to_string());
             return;
         }
 
-        app.ensure_active_topic();
         let active_topic_id = app.active_topic_id.expect("active topic exists");
+        let settings = app.settings.clone();
         let topic = app.active_topic_mut().expect("active topic exists");
         if topic.title == "新话题" {
             topic.title = "总结标题中...".to_string();
@@ -1020,10 +1100,10 @@ pub fn send_learning_request(mut state: Signal<AppState>) {
 
         app.chat_input.clear();
         app.answer_input.clear();
-        app.loading = Some("AI 正在讲解并生成练习...".to_string());
+        app.loading = Some("AI 正在讲解、审题并生成练习...".to_string());
         app.error = None;
         app.status = None;
-        (active_topic_id, topic_text, app.settings.clone())
+        (active_topic_id, topic_text, settings)
     };
     persist_signal(state);
 
@@ -1064,6 +1144,98 @@ pub fn send_learning_request(mut state: Signal<AppState>) {
                     if topic.title == "总结标题中..." {
                         topic.title = title_from_input(&topic_text);
                     }
+                    topic
+                        .messages
+                        .push(ChatMessage::assistant(format!("请求失败：{error}"), None));
+                    topic.updated_at = Utc::now();
+                }
+            }
+        }
+        persist_signal(state);
+    });
+}
+
+fn explanation_context_for_topic(topic: &TopicSession) -> String {
+    topic
+        .messages
+        .iter()
+        .filter(|message| {
+            message.role == ChatRole::Assistant && !message.content.starts_with("请求失败：")
+        })
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n---\n\n")
+}
+
+fn send_follow_up_request(mut state: Signal<AppState>) {
+    let (topic_id, settings, messages, concept_json, exercises_json, attempts_json) = {
+        let mut app = state.write();
+        let question = app.chat_input.trim().to_string();
+        if question.is_empty() {
+            app.error = Some("请输入追问内容".to_string());
+            return;
+        }
+
+        let settings = app.settings.clone();
+        let Some(topic) = app.active_topic_mut() else {
+            app.error = Some("当前没有可用话题".to_string());
+            return;
+        };
+        let topic_id = topic.id;
+        topic.messages.push(ChatMessage::user(question));
+        topic.updated_at = Utc::now();
+        let messages = topic.messages.clone();
+        let concept_json =
+            serde_json::to_string_pretty(&topic.concept).unwrap_or_else(|_| "null".to_string());
+        let exercises_json =
+            serde_json::to_string_pretty(&topic.exercises).unwrap_or_else(|_| "[]".to_string());
+        let attempts_json =
+            serde_json::to_string_pretty(&topic.attempts).unwrap_or_else(|_| "[]".to_string());
+
+        app.chat_input.clear();
+        app.loading = Some("AI 正在回复追问...".to_string());
+        app.error = None;
+        app.status = None;
+
+        (
+            topic_id,
+            settings,
+            messages,
+            concept_json,
+            exercises_json,
+            attempts_json,
+        )
+    };
+    persist_signal(state);
+
+    spawn_forever(async move {
+        let result = AiClient::default()
+            .follow_up(
+                &settings,
+                &messages,
+                &concept_json,
+                &exercises_json,
+                &attempts_json,
+            )
+            .await;
+        match result {
+            Ok(answer) => {
+                let mut app = state.write();
+                if let Some(topic) = app.topic_mut(topic_id) {
+                    topic
+                        .messages
+                        .push(ChatMessage::assistant(answer.clone(), Some(answer)));
+                    topic.updated_at = Utc::now();
+                }
+                app.loading = None;
+                app.status = Some("已回复追问".to_string());
+                app.error = None;
+            }
+            Err(error) => {
+                let mut app = state.write();
+                app.loading = None;
+                app.error = Some(error.to_string());
+                if let Some(topic) = app.topic_mut(topic_id) {
                     topic
                         .messages
                         .push(ChatMessage::assistant(format!("请求失败：{error}"), None));
@@ -1175,25 +1347,8 @@ pub fn request_experiment(mut state: Signal<AppState>) {
     });
 }
 
-pub fn regenerate_exercises(mut state: Signal<AppState>) {
-    let topic_text = {
-        let app = state.read();
-        app.active_topic()
-            .and_then(|topic| topic.concept.as_ref())
-            .map(|concept| format!("{}：{}", concept.language, concept.title))
-            .or_else(|| {
-                app.active_topic()
-                    .and_then(|topic| topic.messages.first())
-                    .map(|message| message.content.clone())
-            })
-    };
-
-    if let Some(topic_text) = topic_text {
-        state.write().chat_input = topic_text;
-        send_learning_request(state);
-    } else {
-        state.write().error = Some("没有可用于重新生成的知识点".to_string());
-    }
+pub fn regenerate_exercises(state: Signal<AppState>) {
+    regenerate_from_topic(state);
 }
 
 pub fn persist_signal(mut state: Signal<AppState>) {
