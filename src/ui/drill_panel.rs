@@ -2,6 +2,7 @@ use crate::app::{
     regenerate_exercises, request_experiment, select_exercise, submit_answer, update_answer_input,
     APP_STATE,
 };
+use crate::ui::markdown::MarkdownContent;
 use dioxus::prelude::*;
 
 #[component]
@@ -17,10 +18,14 @@ pub fn DrillPanel() -> Element {
                     div { class: "section",
                         h2 { "{concept.title}" }
                         p { class: "muted", "{concept.language}" }
-                        p { "{concept.summary}" }
-                        ul { class: "key-points",
-                            for point in concept.key_points.iter() {
-                                li { "{point}" }
+                        MarkdownContent {
+                            content: concept.summary.clone(),
+                            class: "markdown-body".to_string(),
+                        }
+                        if !concept.key_points.is_empty() {
+                            MarkdownContent {
+                                content: markdown_list(&concept.key_points),
+                                class: "markdown-body".to_string(),
                             }
                         }
                     }
@@ -69,16 +74,18 @@ pub fn DrillPanel() -> Element {
                     div { class: "section",
                         h2 { "{exercise.title}" }
                         p { class: "muted", "{exercise.kind.label()} · {exercise.difficulty}" }
-                        p { "{display_prompt}" }
+                        MarkdownContent {
+                            content: display_prompt,
+                            class: "markdown-body".to_string(),
+                        }
                         if !exercise.starter_code.trim().is_empty() {
                             pre { class: "code-block", "{exercise.starter_code}" }
                         }
                         if !exercise.hints.is_empty() {
                             h3 { "提示" }
-                            ul { class: "key-points",
-                                for hint in exercise.hints.iter() {
-                                    li { "{hint}" }
-                                }
+                            MarkdownContent {
+                                content: markdown_list(&exercise.hints),
+                                class: "markdown-body".to_string(),
                             }
                         }
                     }
@@ -122,23 +129,24 @@ pub fn DrillPanel() -> Element {
                                     h3 { "Review 结果" }
                                     div { class: "review-box",
                                         p { strong { "结论：" } "{verdict} · {review.score}/100" }
-                                        p { "{review.summary}" }
+                                        MarkdownContent {
+                                            content: review.summary.clone(),
+                                            class: "markdown-body".to_string(),
+                                        }
                                         if !review.mistakes.is_empty() {
                                             h3 { "问题" }
-                                            ul { class: "key-points",
-                                                for mistake in review.mistakes.iter() {
-                                                    li { "{mistake}" }
-                                                }
+                                            MarkdownContent {
+                                                content: markdown_list(&review.mistakes),
+                                                class: "markdown-body".to_string(),
                                             }
                                         }
                                         h3 { "修正答案" }
                                         pre { class: "code-block", "{review.corrected_answer}" }
                                         if !review.next_steps.is_empty() {
                                             h3 { "下一步练习" }
-                                            ul { class: "key-points",
-                                                for step in review.next_steps.iter() {
-                                                    li { "{step}" }
-                                                }
+                                            MarkdownContent {
+                                                content: markdown_list(&review.next_steps),
+                                                class: "markdown-body".to_string(),
                                             }
                                         }
                                     }
@@ -178,6 +186,20 @@ fn clean_exercise_prompt(prompt: &str, starter_code: &str) -> String {
     cleaned = cleaned.replace(starter_code, "");
     cleaned = strip_fenced_code_blocks(&cleaned);
     collapse_blank_lines(&cleaned)
+}
+
+fn markdown_list(items: &[String]) -> String {
+    let mut markdown = String::new();
+
+    for item in items {
+        if !markdown.is_empty() {
+            markdown.push('\n');
+        }
+        markdown.push_str("- ");
+        markdown.push_str(&item.trim().replace('\n', "\n  "));
+    }
+
+    markdown
 }
 
 fn strip_fenced_code_blocks(text: &str) -> String {

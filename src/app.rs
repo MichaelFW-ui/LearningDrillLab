@@ -184,39 +184,66 @@ textarea:focus, input:focus, select:focus {
   color: #202225;
 }
 
-.message.assistant.rich-message {
-  max-width: 96%;
+.message.markdown-content {
   white-space: normal;
 }
 
-.rich-message h3 {
-  margin: 8px 0 6px;
-  font-size: 15px;
+.message.assistant.markdown-content {
+  max-width: 96%;
 }
 
-.rich-message h3:first-child { margin-top: 0; }
-.rich-message p { margin: 6px 0; }
-.rich-message strong { font-weight: 720; }
-.rich-message em { font-style: italic; }
-.rich-message del { color: #65716a; }
-.rich-message a { color: #1f6f61; font-weight: 650; text-decoration: underline; }
-.rich-message ul, .rich-message ol { margin: 6px 0; padding-left: 20px; }
-.rich-message li { margin: 3px 0; }
-.rich-message li > p { margin: 2px 0; }
-.rich-message input[type="checkbox"] { margin-right: 6px; }
-.rich-message blockquote {
+.markdown-content h1,
+.markdown-content h2,
+.markdown-content h3,
+.markdown-content h4,
+.markdown-content h5,
+.markdown-content h6 {
+  margin: 8px 0 6px;
+  font-size: 15px;
+  line-height: 1.25;
+}
+
+.markdown-content h1:first-child,
+.markdown-content h2:first-child,
+.markdown-content h3:first-child,
+.markdown-content h4:first-child,
+.markdown-content h5:first-child,
+.markdown-content h6:first-child,
+.markdown-content p:first-child,
+.markdown-content ul:first-child,
+.markdown-content ol:first-child,
+.markdown-content pre:first-child,
+.markdown-content blockquote:first-child { margin-top: 0; }
+
+.markdown-content p:last-child,
+.markdown-content ul:last-child,
+.markdown-content ol:last-child,
+.markdown-content pre:last-child,
+.markdown-content blockquote:last-child { margin-bottom: 0; }
+
+.markdown-content p { margin: 6px 0; }
+.markdown-content strong { font-weight: 720; }
+.markdown-content em { font-style: italic; }
+.markdown-content del { color: #65716a; }
+.markdown-content a { color: #1f6f61; font-weight: 650; text-decoration: underline; }
+.message.user.markdown-content a { color: #ffffff; }
+.markdown-content ul, .markdown-content ol { margin: 6px 0; padding-left: 20px; }
+.markdown-content li { margin: 3px 0; }
+.markdown-content li > p { margin: 2px 0; }
+.markdown-content input[type="checkbox"] { margin-right: 6px; }
+.markdown-content blockquote {
   margin: 8px 0;
   padding: 4px 0 4px 10px;
   border-left: 3px solid #9dbeb4;
   color: #4c5752;
 }
-.rich-message hr {
+.markdown-content hr {
   border: 0;
   border-top: 1px solid #cfd7d2;
   margin: 10px 0;
 }
 
-.rich-message code {
+.markdown-content code {
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
   font-size: 0.92em;
   background: #dde5df;
@@ -224,20 +251,13 @@ textarea:focus, input:focus, select:focus {
   padding: 1px 4px;
 }
 
-.rich-message .code-block {
+.message.user.markdown-content code {
+  background: rgba(255, 255, 255, 0.18);
+  color: #ffffff;
+}
+
+.markdown-content pre {
   margin: 8px 0;
-}
-
-.rich-message .code-language {
-  display: inline-block;
-  margin-bottom: 4px;
-  color: #647069;
-  font-size: 12px;
-  font-weight: 650;
-}
-
-.rich-message pre {
-  margin: 0;
   background: #202723;
   color: #eef8f2;
   border-radius: 7px;
@@ -246,7 +266,7 @@ textarea:focus, input:focus, select:focus {
   white-space: pre;
 }
 
-.rich-message pre code {
+.markdown-content pre code {
   display: block;
   min-width: max-content;
   background: transparent;
@@ -255,28 +275,40 @@ textarea:focus, input:focus, select:focus {
   color: inherit;
 }
 
-.rich-message .table-scroll {
+.markdown-content table {
+  display: block;
   margin: 8px 0;
   overflow-x: auto;
-}
-
-.rich-message table {
   width: max-content;
   min-width: 100%;
   border-collapse: collapse;
   font-size: 13px;
 }
 
-.rich-message th, .rich-message td {
+.markdown-content th, .markdown-content td {
   border: 1px solid #cbd4ce;
   padding: 6px 8px;
   text-align: left;
   vertical-align: top;
 }
 
-.rich-message thead td {
+.markdown-content thead th {
   background: #dfe8e2;
   font-weight: 720;
+}
+
+.markdown-content .math {
+  color: inherit;
+}
+
+.markdown-content .math-inline {
+  white-space: nowrap;
+}
+
+.markdown-content .math-display {
+  margin: 10px 0;
+  overflow-x: auto;
+  text-align: center;
 }
 
 .composer {
@@ -426,6 +458,87 @@ textarea:focus, input:focus, select:focus {
 "#;
 
 const APP_JS: &str = r#"
+(function() {
+  if (window.__learningDrillMarkdownReady) {
+    return;
+  }
+
+  window.__learningDrillMarkdownReady = true;
+  window.MathJax = {
+    tex: {
+      inlineMath: [["\\(", "\\)"], ["$", "$"]],
+      displayMath: [["\\[", "\\]"], ["$$", "$$"]],
+      processEscapes: true
+    },
+    options: {
+      skipHtmlTags: ["script", "noscript", "style", "textarea", "pre", "code"]
+    }
+  };
+
+  var pending = false;
+  var observerStarted = false;
+
+  function enhanceMarkdownLinks() {
+    document.querySelectorAll(".markdown-content a[href]").forEach(function(link) {
+      var href = link.getAttribute("href") || "";
+      if (href.indexOf("http://") === 0 || href.indexOf("https://") === 0 || href.indexOf("mailto:") === 0) {
+        link.setAttribute("target", "_blank");
+        link.setAttribute("rel", "noreferrer noopener");
+      }
+    });
+  }
+
+  function typesetMarkdownMath() {
+    enhanceMarkdownLinks();
+    if (!window.MathJax || !window.MathJax.typesetPromise) {
+      return;
+    }
+
+    window.MathJax.typesetPromise(Array.from(document.querySelectorAll(".markdown-content"))).catch(function(error) {
+      console.warn("MathJax typeset failed", error);
+    });
+  }
+
+  function scheduleMarkdownEnhancement() {
+    if (pending) {
+      return;
+    }
+
+    pending = true;
+    window.setTimeout(function() {
+      pending = false;
+      typesetMarkdownMath();
+    }, 60);
+  }
+
+  function startMarkdownEnhancement() {
+    if (observerStarted) {
+      return;
+    }
+    if (!document.body) {
+      window.setTimeout(startMarkdownEnhancement, 20);
+      return;
+    }
+
+    observerStarted = true;
+    enhanceMarkdownLinks();
+    new MutationObserver(scheduleMarkdownEnhancement).observe(document.body, {
+      childList: true,
+      subtree: true,
+      characterData: true
+    });
+    scheduleMarkdownEnhancement();
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", startMarkdownEnhancement);
+  } else {
+    startMarkdownEnhancement();
+  }
+
+  window.addEventListener("load", scheduleMarkdownEnhancement);
+})();
+
 document.addEventListener("keydown", function(event) {
   var target = event.target;
   if (!target || !target.classList || !target.classList.contains("code-input")) {
@@ -453,6 +566,10 @@ pub fn App() -> Element {
     rsx! {
         style { "{APP_CSS}" }
         script { "{APP_JS}" }
+        script {
+            src: "https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js",
+            r#async: true,
+        }
         div { class: "app-shell",
             div { class: "topbar",
                 div { class: "brand",

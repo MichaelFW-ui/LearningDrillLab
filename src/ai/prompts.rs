@@ -3,6 +3,7 @@ pub fn learning_system_prompt() -> &'static str {
 Return only valid JSON. Do not wrap JSON in markdown fences.
 Teach in Chinese. Optimize for technical correctness, clear mental models, and fair practice.
 If web_search is available, use it before finalizing version-sensitive, library-specific, API-specific, or non-obvious technical claims. Send one concise search query with multiple keywords; do not split one investigation into multiple search queries. If web_fetch is available, read primary source URLs when snippets are not enough, then revise your answer against the fetched evidence.
+When writing math in Markdown text fields, use only dollar-delimited LaTeX: inline math as $a + b$ and display math as $$\sum_i x_i$$ on its own line. Do not use \( ... \), \[ ... \], bare LaTeX, Unicode-only pseudo-formulas, or fenced code blocks for math unless you are showing source code.
 Never invent failure modes to force an exercise. If you are not sure a premise is true, design an observation, prediction, or construction task instead."#
 }
 
@@ -11,6 +12,7 @@ pub fn follow_up_system_prompt() -> &'static str {
 Teach in Chinese. The learner may challenge, correct, or ask follow-up questions about your previous explanation, exercises, or reviews.
 Answer directly and technically. If the learner's challenge is correct, acknowledge it and correct the earlier explanation or judgment.
 If web_search is available and the answer depends on current docs, library semantics, version-specific behavior, or disputed factual claims, search before answering. If web_fetch is available, fetch official or primary source URLs when snippets are insufficient, then correct your answer against the fetched evidence.
+When writing math, use only dollar-delimited LaTeX: inline math as $a + b$ and display math as $$\sum_i x_i$$ on its own line. Do not use \( ... \), \[ ... \], bare LaTeX, Unicode-only pseudo-formulas, or fenced code blocks for math unless you are showing source code.
 Use Markdown when it improves clarity. Do not return JSON for this follow-up chat."#
 }
 
@@ -42,6 +44,7 @@ Constraints:
 - Teach only what you can explain concretely.
 - If web_search is available, search before writing the final JSON whenever the topic is a library/framework/API, version-sensitive behavior, or a claim likely to be checked against docs. If web_fetch is available, fetch the most relevant official or primary URLs before relying on them. Incorporate the evidence into the explanation and cite source URLs with markdown links where useful.
 - When behavior depends on runtime, compiler, library version, environment, or configuration, describe that dependency instead of turning it into an absolute rule.
+- In all Markdown-capable JSON string fields, write math only as dollar-delimited LaTeX: inline math as $a + b$ and display math as $$\sum_i x_i$$ on its own line. Do not use \( ... \), \[ ... \], bare LaTeX, Unicode-only pseudo-formulas, or fenced code blocks for math unless you are showing source code.
 - Return only valid JSON. Do not wrap JSON in markdown fences."#
     )
 }
@@ -104,6 +107,7 @@ Exercise design rules:
 - The prompt and expected_answer must be aligned. Hints must not add requirements that are absent from the prompt.
 - Stay inside the explanation/context source of truth. Do not require niche facts that were not taught.
 - This is attempt {attempt} for slot {slot}; avoid patterns already rejected above.
+- In prompt, expected_answer, and hints, write math only as dollar-delimited LaTeX: inline math as $a + b$ and display math as $$\sum_i x_i$$ on its own line. Do not use \( ... \), \[ ... \], bare LaTeX, Unicode-only pseudo-formulas, or fenced code blocks for math unless you are showing source code.
 - Return only valid JSON. Do not wrap JSON in markdown fences."#
     )
 }
@@ -206,6 +210,7 @@ Review contract:
 - If the exercise is false, ambiguous, or more restrictive than its prompt justifies, set is_correct to true, give a high score, explain the flaw in summary, keep mistakes empty or minimal, and provide a corrected exercise or answer in corrected_answer.
 - Hints are not requirements unless the prompt validly makes them requirements.
 - Mark the learner wrong only when the exercise is valid and the learner's answer is technically wrong relative to that valid exercise.
+- In summary, mistakes, corrected_answer, and next_steps, write math only as dollar-delimited LaTeX: inline math as $a + b$ and display math as $$\sum_i x_i$$ on its own line. Do not use \( ... \), \[ ... \], bare LaTeX, Unicode-only pseudo-formulas, or fenced code blocks for math unless you are showing source code.
 
 Return JSON with this exact shape:
 {{
@@ -260,6 +265,7 @@ Experiment contract:
 - Ask the code agent to print relevant observable facts for the domain, such as values, types, shapes, state changes, compiler diagnostics, runtime errors, or outputs.
 - Ask the code agent to compare observations with expected_answer and hints, then classify the exercise as valid, flawed, or underspecified.
 - Do not turn this into a general concept demo; the selected exercise is the object under test.
+- In title and prompt, write math only as dollar-delimited LaTeX: inline math as $a + b$ and display math as $$\sum_i x_i$$ on its own line. Do not use \( ... \), \[ ... \], bare LaTeX, Unicode-only pseudo-formulas, or fenced code blocks for math unless you are showing source code.
 
 Return JSON with this exact shape:
 {{
