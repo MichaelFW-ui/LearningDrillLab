@@ -5,11 +5,12 @@ use crate::domain::exercise::{Exercise, ExerciseKind, ExperimentPrompt};
 use crate::domain::review::ReviewResult;
 use directories::ProjectDirs;
 use reqwest::StatusCode;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -22,6 +23,12 @@ pub enum AiError {
     Request(#[from] reqwest::Error),
     #[error("API 返回 HTTP {status}: {body}")]
     Http { status: StatusCode, body: String },
+    #[error("{label} API 返回 HTTP {status}: {body}")]
+    LabeledHttp {
+        label: String,
+        status: StatusCode,
+        body: String,
+    },
     #[error("API 响应里没有可用内容")]
     EmptyResponse,
     #[error("API 响应未正常完成: finish_reason={finish_reason}")]
@@ -54,6 +61,14 @@ pub struct ExplainAndGenerateResponse {
     pub raw_response: String,
 }
 
+#[derive(Debug, Clone)]
+struct SearchToolRuntime {
+    bocha_key: Option<String>,
+    tavily_key: Option<String>,
+    tavily_base_url: String,
+    jina_key: Option<String>,
+}
+
 impl AiClient {
     pub async fn fetch_models(&self, settings: &ApiSettings) -> Result<Vec<String>, AiError> {
         let api_key = require_api_key(settings)?;
@@ -73,7 +88,7 @@ impl AiClient {
         topic: &str,
     ) -> Result<ExplainAndGenerateResponse, AiError> {
         let raw = self
-            .chat_completion(
+            .chat_completion_with_search(
                 "concept.explain",
                 settings,
                 vec![
@@ -83,7 +98,9 @@ impl AiClient {
                 true,
             )
             .await?;
-        let parsed: TopicExplanationWire = parse_ai_json(&raw)?;
+        let parsed: TopicExplanationWire = self
+            .parse_ai_json_or_repair("concept.explain", settings, &raw)
+            .await?;
         let concept_json = serde_json::to_string_pretty(&parsed.concept)?;
         let exercises = self
             .generate_validated_exercises(settings, &concept_json, &parsed.explanation, None)
@@ -112,7 +129,7 @@ impl AiClient {
     ) -> Result<ReviewResult, AiError> {
         let exercise_json = serde_json::to_string_pretty(exercise)?;
         let validation_raw = self
-            .chat_completion(
+            .chat_completion_with_search(
                 "review.exercise_gate",
                 settings,
                 vec![
@@ -122,7 +139,9 @@ impl AiClient {
                 true,
             )
             .await?;
-        let validation: ExerciseValidationWire = parse_ai_json(&validation_raw)?;
+        let validation: ExerciseValidationWire = self
+            .parse_ai_json_or_repair("review.exercise_gate", settings, &validation_raw)
+            .await?;
         if !validation.is_accepted() {
             return Ok(ReviewResult::new(
                 None,
@@ -140,7 +159,7 @@ impl AiClient {
         }
 
         let raw = self
-            .chat_completion(
+            .chat_completion_with_search(
                 "review",
                 settings,
                 vec![
@@ -150,7 +169,9 @@ impl AiClient {
                 true,
             )
             .await?;
-        let parsed: ReviewResultWire = parse_ai_json(&raw)?;
+        let parsed: ReviewResultWire = self
+            .parse_ai_json_or_repair("review", settings, &raw)
+            .await?;
         Ok(parsed.into_review(Some(raw)))
     }
 
@@ -197,7 +218,7 @@ impl AiClient {
 
         wire_messages.extend(messages.iter().map(ChatMessageWire::from_chat_message));
 
-        self.chat_completion("follow_up", settings, wire_messages, false)
+        self.chat_completion_with_search("follow_up", settings, wire_messages, false)
             .await
     }
 
@@ -223,7 +244,9 @@ impl AiClient {
                 true,
             )
             .await?;
-        let parsed: ExperimentPromptWire = parse_ai_json(&raw)?;
+        let parsed: ExperimentPromptWire = self
+            .parse_ai_json_or_repair("experiment_prompt", settings, &raw)
+            .await?;
         Ok(ExperimentPrompt::new(parsed.title, parsed.prompt))
     }
 
@@ -249,7 +272,7 @@ impl AiClient {
                 let accepted_json = serde_json::to_string_pretty(&accepted)?;
                 let rejected_json = serde_json::to_string_pretty(&rejected)?;
                 let raw = self
-                    .chat_completion(
+                    .chat_completion_with_search(
                         "exercise.generate_one",
                         settings,
                         vec![
@@ -268,10 +291,12 @@ impl AiClient {
                         true,
                     )
                     .await?;
-                let exercise: ExerciseWire = parse_ai_json(&raw)?;
+                let exercise: ExerciseWire = self
+                    .parse_ai_json_or_repair("exercise.generate_one", settings, &raw)
+                    .await?;
                 let exercise_json = serde_json::to_string_pretty(&exercise)?;
                 let validation_raw = self
-                    .chat_completion(
+                    .chat_completion_with_search(
                         "exercise.validate_one",
                         settings,
                         vec![
@@ -286,7 +311,9 @@ impl AiClient {
                         true,
                     )
                     .await?;
-                let validation: ExerciseValidationWire = parse_ai_json(&validation_raw)?;
+                let validation: ExerciseValidationWire = self
+                    .parse_ai_json_or_repair("exercise.validate_one", settings, &validation_raw)
+                    .await?;
 
                 if validation.is_accepted() {
                     accepted.push(exercise);
@@ -312,6 +339,313 @@ impl AiClient {
         })
     }
 
+    async fn parse_ai_json_or_repair<T>(
+        &self,
+        label: &str,
+        settings: &ApiSettings,
+        raw: &str,
+    ) -> Result<T, AiError>
+    where
+        T: DeserializeOwned,
+    {
+        match parse_ai_json(raw) {
+            Ok(parsed) => Ok(parsed),
+            Err(error) => {
+                log_ai_event(label, "json_parse_failed", &error.to_string());
+                let repaired = self.repair_ai_json(label, settings, raw, &error).await?;
+                match parse_ai_json(&repaired) {
+                    Ok(parsed) => Ok(parsed),
+                    Err(repair_error) => {
+                        log_ai_event(label, "json_repair_failed", &repair_error.to_string());
+                        let rebuilt = self
+                            .rebuild_ai_json(label, settings, raw, &repair_error)
+                            .await?;
+                        parse_ai_json(&rebuilt)
+                    }
+                }
+            }
+        }
+    }
+
+    async fn repair_ai_json(
+        &self,
+        label: &str,
+        settings: &ApiSettings,
+        raw: &str,
+        error: &AiError,
+    ) -> Result<String, AiError> {
+        let raw_json_string = serde_json::to_string(raw)?;
+        let schema = json_repair_schema(label);
+        let repair_prompt = format!(
+            r#"The following assistant output was intended to be a single JSON object, but it is malformed.
+
+Parse error:
+{error}
+
+Expected schema:
+{schema}
+
+Repair it into valid JSON without changing the data model, field names, language, markdown content, code blocks, URLs, or meaning.
+Most failures are caused by unescaped double quotes inside JSON strings, unfinished strings, or truncated closing braces. Escape inner quotes correctly.
+Return only the repaired JSON object. Do not wrap it in markdown fences.
+
+Malformed JSON is provided below as a JSON string. Decode it mentally first; do not output this wrapper string:
+{raw_json_string}"#
+        );
+
+        self.chat_completion(
+            &format!("{label}.json_repair"),
+            settings,
+            vec![
+                ChatMessageWire::system(
+                    "You repair malformed JSON. Return only valid JSON. Do not explain.",
+                ),
+                ChatMessageWire::user(repair_prompt),
+            ],
+            true,
+        )
+        .await
+    }
+
+    async fn rebuild_ai_json(
+        &self,
+        label: &str,
+        settings: &ApiSettings,
+        raw: &str,
+        error: &AiError,
+    ) -> Result<String, AiError> {
+        let raw_json_string = serde_json::to_string(raw)?;
+        let schema = json_repair_schema(label);
+        let prompt = format!(
+            r#"The prior JSON repair failed.
+
+Parse error after repair:
+{error}
+
+Reconstruct a valid JSON object from the malformed assistant output.
+
+Expected schema:
+{schema}
+
+Rules:
+- Return exactly one valid JSON object.
+- Preserve all useful Chinese explanation content, markdown, code blocks, source URLs, and technical details from the malformed output.
+- Use the expected schema and field names exactly.
+- Do not summarize, shorten, or replace content with placeholders.
+- Escape all quotes inside JSON strings.
+- Do not wrap the JSON in markdown fences.
+
+Malformed assistant output is encoded as this JSON string:
+{raw_json_string}"#
+        );
+
+        self.chat_completion(
+            &format!("{label}.json_rebuild"),
+            settings,
+            vec![
+                ChatMessageWire::system(
+                    "You reconstruct malformed assistant output into a valid JSON object that matches the requested schema. Return only valid JSON.",
+                ),
+                ChatMessageWire::user(prompt),
+            ],
+            true,
+        )
+        .await
+    }
+
+    async fn run_search_query(
+        &self,
+        search_runtime: &SearchToolRuntime,
+        query: &str,
+    ) -> Result<Vec<SearchResultWire>, AiError> {
+        let mut failures = Vec::new();
+        for provider in search_runtime.search_providers() {
+            let provider_name = provider.name();
+            let result = match provider {
+                SearchProvider::Tavily { api_key, base_url } => {
+                    self.search_tavily(api_key, base_url, query).await
+                }
+                SearchProvider::Bocha { api_key } => self.search_bocha(api_key, query).await,
+            };
+
+            match result {
+                Ok(mut results) => {
+                    if !failures.is_empty() {
+                        results.insert(0, fallback_search_note(query, provider_name, &failures));
+                    }
+                    return Ok(results);
+                }
+                Err(error) => {
+                    log_ai_event(
+                        "search.fallback",
+                        "provider_failed",
+                        &format!("{provider_name}: {error}"),
+                    );
+                    failures.push(format!("{provider_name}: {error}"));
+                }
+            }
+        }
+
+        if failures.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Err(AiError::QualityGateFailed(format!(
+                "所有搜索服务都失败：{}",
+                failures.join("；")
+            )))
+        }
+    }
+
+    async fn run_fetch_urls(
+        &self,
+        jina_key: Option<&str>,
+        urls: &[String],
+    ) -> Result<Vec<FetchedPageWire>, AiError> {
+        let mut pages = Vec::new();
+        for (index, url) in urls.iter().enumerate() {
+            if index > 0 {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+            pages.push(self.fetch_jina_reader(jina_key, url).await?);
+        }
+        Ok(pages)
+    }
+
+    async fn search_bocha(
+        &self,
+        api_key: &str,
+        query: &str,
+    ) -> Result<Vec<SearchResultWire>, AiError> {
+        let payload = json!({
+            "query": query,
+            "freshness": "noLimit",
+            "summary": true,
+            "count": 10
+        });
+        log_ai_request("search.bocha", &payload);
+        let response = self
+            .http
+            .post("https://api.bochaai.com/v1/web-search")
+            .bearer_auth(api_key)
+            .json(&payload)
+            .send()
+            .await?;
+        let response = ensure_success_labeled("search.bocha", response).await?;
+        let body: Value = response.json().await?;
+        log_ai_event(
+            "search.bocha",
+            "response",
+            &serde_json::to_string_pretty(&body).unwrap_or_else(|_| body.to_string()),
+        );
+        Ok(parse_bocha_results(query, &body))
+    }
+
+    async fn search_tavily(
+        &self,
+        api_key: &str,
+        base_url: &str,
+        query: &str,
+    ) -> Result<Vec<SearchResultWire>, AiError> {
+        let payload = json!({
+            "query": query,
+            "search_depth": "advanced",
+            "max_results": 10,
+            "include_answer": true,
+            "include_raw_content": false
+        });
+        log_ai_request("search.tavily", &payload);
+        let response = self
+            .http
+            .post(tavily_search_url(base_url))
+            .bearer_auth(api_key)
+            .json(&payload)
+            .send()
+            .await?;
+        let response = ensure_success_labeled("search.tavily", response).await?;
+        let body: Value = response.json().await?;
+        log_ai_event(
+            "search.tavily",
+            "response",
+            &serde_json::to_string_pretty(&body).unwrap_or_else(|_| body.to_string()),
+        );
+        Ok(parse_tavily_results(query, &body))
+    }
+
+    async fn fetch_jina_reader(
+        &self,
+        api_key: Option<&str>,
+        url: &str,
+    ) -> Result<FetchedPageWire, AiError> {
+        match self.fetch_jina_reader_once(None, url).await {
+            Ok(page) => return Ok(page),
+            Err(error) if should_retry_jina_with_key(error.status) => {
+                log_ai_event(
+                    "fetch.jina.public",
+                    "fallback_to_key",
+                    &format!("HTTP {}: {}", error.status, error.body),
+                );
+                if let Some(api_key) = api_key {
+                    return self
+                        .fetch_jina_reader_once(Some(api_key), url)
+                        .await
+                        .map_err(|error| AiError::LabeledHttp {
+                            label: "fetch.jina.key".to_string(),
+                            status: error.status,
+                            body: error.body,
+                        });
+                }
+                return Err(AiError::LabeledHttp {
+                    label: "fetch.jina.public".to_string(),
+                    status: error.status,
+                    body: error.body,
+                });
+            }
+            Err(error) => {
+                return Err(AiError::LabeledHttp {
+                    label: "fetch.jina.public".to_string(),
+                    status: error.status,
+                    body: error.body,
+                })
+            }
+        }
+    }
+
+    async fn fetch_jina_reader_once(
+        &self,
+        api_key: Option<&str>,
+        url: &str,
+    ) -> Result<FetchedPageWire, HttpStatusError> {
+        let reader_url = jina_reader_url(url);
+        let label = if api_key.is_some() {
+            "fetch.jina.key"
+        } else {
+            "fetch.jina.public"
+        };
+        log_ai_event(label, "request", &reader_url);
+        let mut request = self
+            .http
+            .get(&reader_url)
+            .header(reqwest::header::ACCEPT, "text/plain");
+        if let Some(api_key) = api_key {
+            request = request.bearer_auth(api_key);
+        }
+        let response = request.send().await?;
+        let response = ensure_success_status(response).await?;
+        let body = response.text().await?;
+        log_ai_event(label, "response", &body);
+        let (content, truncated) = truncate_text(&body, 18_000);
+        Ok(FetchedPageWire {
+            provider: if api_key.is_some() {
+                "Jina Reader (API key)".to_string()
+            } else {
+                "Jina Reader (public)".to_string()
+            },
+            url: url.to_string(),
+            content,
+            truncated,
+        })
+    }
+
     async fn chat_completion(
         &self,
         label: &str,
@@ -319,6 +653,38 @@ impl AiClient {
         messages: Vec<ChatMessageWire>,
         json_response: bool,
     ) -> Result<String, AiError> {
+        self.chat_completion_inner(label, settings, messages, json_response, None)
+            .await
+    }
+
+    async fn chat_completion_with_search(
+        &self,
+        label: &str,
+        settings: &ApiSettings,
+        messages: Vec<ChatMessageWire>,
+        json_response: bool,
+    ) -> Result<String, AiError> {
+        let search_runtime = search_tool_runtime(settings);
+        self.chat_completion_inner(
+            label,
+            settings,
+            messages,
+            json_response,
+            search_runtime.as_ref(),
+        )
+        .await
+    }
+
+    async fn chat_completion_inner(
+        &self,
+        label: &str,
+        settings: &ApiSettings,
+        mut messages: Vec<ChatMessageWire>,
+        json_response: bool,
+        search_runtime: Option<&SearchToolRuntime>,
+    ) -> Result<String, AiError> {
+        const MAX_TOOL_ROUNDS: usize = 4;
+
         let api_key = require_api_key(settings)?;
         let model = require_model(settings)?;
         let url = format!(
@@ -326,24 +692,125 @@ impl AiClient {
             normalize_base_url(&settings.base_url)
         );
         let deepseek_thinking = is_deepseek_base_url(&settings.base_url);
-        let mut payload = json!({
-            "model": model,
-            "messages": messages
-        });
 
-        if deepseek_thinking {
-            payload["thinking"] = json!({ "type": "enabled" });
-            payload["reasoning_effort"] = json!("high");
-        } else {
-            payload["temperature"] = json!(0.2);
+        for round in 0..=MAX_TOOL_ROUNDS {
+            let payload = chat_completion_payload(
+                &model,
+                &messages,
+                json_response,
+                deepseek_thinking,
+                search_runtime,
+            );
+
+            let round_label = if round == 0 {
+                label.to_string()
+            } else {
+                format!("{label}.tool_round_{round}")
+            };
+            log_ai_request(&round_label, &payload);
+
+            let response = self
+                .http
+                .post(&url)
+                .bearer_auth(&api_key)
+                .json(&payload)
+                .send()
+                .await?;
+            let response = ensure_success(response).await?;
+            let body: ChatCompletionResponse = response.json().await?;
+            let choice = body
+                .choices
+                .into_iter()
+                .next()
+                .ok_or(AiError::EmptyResponse)?;
+            log_ai_response(
+                &round_label,
+                choice.message.reasoning_content.as_deref(),
+                choice.message.content.as_deref().unwrap_or_default(),
+                choice.finish_reason.as_deref(),
+            );
+
+            if choice.finish_reason.as_deref() == Some("length") {
+                return self
+                    .continue_after_length(
+                        &round_label,
+                        &api_key,
+                        &url,
+                        &model,
+                        messages,
+                        choice.message.content.unwrap_or_default(),
+                        deepseek_thinking,
+                    )
+                    .await;
+            }
+
+            if let Some(finish_reason) = choice.finish_reason.as_deref() {
+                if !matches!(finish_reason, "stop" | "tool_calls") {
+                    return Err(AiError::IncompleteResponse {
+                        finish_reason: finish_reason.to_string(),
+                    });
+                }
+            }
+
+            if let Some(tool_calls) = choice
+                .message
+                .tool_calls
+                .clone()
+                .filter(|calls| !calls.is_empty())
+            {
+                let Some(search_runtime) = search_runtime else {
+                    return Err(AiError::EmptyResponse);
+                };
+                messages.push(ChatMessageWire::assistant_with_tool_calls(
+                    choice.message.content,
+                    tool_calls.clone(),
+                ));
+
+                for tool_call in tool_calls {
+                    let tool_result = self.execute_tool_call(search_runtime, &tool_call).await?;
+                    messages.push(ChatMessageWire::tool(tool_call.id, tool_result));
+                }
+                continue;
+            }
+
+            return choice
+                .message
+                .content
+                .filter(|content| !content.trim().is_empty())
+                .ok_or(AiError::EmptyResponse);
         }
 
-        if json_response {
-            payload["response_format"] = json!({ "type": "json_object" });
-            payload["max_tokens"] = json!(8192);
-        }
+        self.finalize_after_tool_limit(
+            label,
+            &api_key,
+            &url,
+            &model,
+            messages,
+            json_response,
+            deepseek_thinking,
+            MAX_TOOL_ROUNDS,
+        )
+        .await
+    }
 
-        log_ai_request(label, &payload);
+    async fn finalize_after_tool_limit(
+        &self,
+        label: &str,
+        api_key: &str,
+        url: &str,
+        model: &str,
+        mut messages: Vec<ChatMessageWire>,
+        json_response: bool,
+        deepseek_thinking: bool,
+        max_tool_rounds: usize,
+    ) -> Result<String, AiError> {
+        messages.push(ChatMessageWire::user(format!(
+            "You have already used the available search/fetch tool budget ({max_tool_rounds} rounds). Do not call any more tools. Use the evidence already present in the conversation and produce the final answer now. If evidence is incomplete, state the uncertainty instead of searching again."
+        )));
+        let payload =
+            chat_completion_payload(model, &messages, json_response, deepseek_thinking, None);
+        let final_label = format!("{label}.tool_limit_final");
+        log_ai_request(&final_label, &payload);
 
         let response = self
             .http
@@ -360,14 +827,28 @@ impl AiClient {
             .next()
             .ok_or(AiError::EmptyResponse)?;
         log_ai_response(
-            label,
+            &final_label,
             choice.message.reasoning_content.as_deref(),
             choice.message.content.as_deref().unwrap_or_default(),
             choice.finish_reason.as_deref(),
         );
 
+        if choice.finish_reason.as_deref() == Some("length") {
+            return self
+                .continue_after_length(
+                    &final_label,
+                    api_key,
+                    url,
+                    model,
+                    messages,
+                    choice.message.content.unwrap_or_default(),
+                    deepseek_thinking,
+                )
+                .await;
+        }
+
         if let Some(finish_reason) = choice.finish_reason.as_deref() {
-            if !matches!(finish_reason, "stop" | "tool_calls") {
+            if !matches!(finish_reason, "stop") {
                 return Err(AiError::IncompleteResponse {
                     finish_reason: finish_reason.to_string(),
                 });
@@ -379,6 +860,124 @@ impl AiClient {
             .content
             .filter(|content| !content.trim().is_empty())
             .ok_or(AiError::EmptyResponse)
+    }
+
+    async fn continue_after_length(
+        &self,
+        label: &str,
+        api_key: &str,
+        url: &str,
+        model: &str,
+        mut messages: Vec<ChatMessageWire>,
+        first_content: String,
+        deepseek_thinking: bool,
+    ) -> Result<String, AiError> {
+        const MAX_CONTINUATIONS: usize = 3;
+
+        let mut combined = first_content;
+        if combined.trim().is_empty() {
+            return Err(AiError::EmptyResponse);
+        }
+
+        messages.push(ChatMessageWire::assistant(combined.clone()));
+        for index in 1..=MAX_CONTINUATIONS {
+            messages.push(ChatMessageWire::user(
+                "The previous response was cut off by the output token limit. Continue exactly from the next character. Do not repeat previous text. Do not summarize or shorten. Do not add commentary. If this is JSON, continue the same JSON text until it is complete.",
+            ));
+            let payload = chat_completion_payload(model, &messages, false, deepseek_thinking, None);
+            let continuation_label = format!("{label}.length_continue_{index}");
+            log_ai_request(&continuation_label, &payload);
+
+            let response = self
+                .http
+                .post(url)
+                .bearer_auth(api_key)
+                .json(&payload)
+                .send()
+                .await?;
+            let response = ensure_success(response).await?;
+            let body: ChatCompletionResponse = response.json().await?;
+            let choice = body
+                .choices
+                .into_iter()
+                .next()
+                .ok_or(AiError::EmptyResponse)?;
+            let content = choice.message.content.unwrap_or_default();
+            log_ai_response(
+                &continuation_label,
+                choice.message.reasoning_content.as_deref(),
+                &content,
+                choice.finish_reason.as_deref(),
+            );
+            if content.trim().is_empty() {
+                return Err(AiError::EmptyResponse);
+            }
+
+            combined.push_str(&content);
+            messages.push(ChatMessageWire::assistant(content));
+
+            match choice.finish_reason.as_deref() {
+                Some("stop") | None => return Ok(combined),
+                Some("length") => continue,
+                Some(finish_reason) => {
+                    return Err(AiError::IncompleteResponse {
+                        finish_reason: finish_reason.to_string(),
+                    })
+                }
+            }
+        }
+
+        Ok(combined)
+    }
+
+    async fn execute_tool_call(
+        &self,
+        search_runtime: &SearchToolRuntime,
+        tool_call: &ToolCallWire,
+    ) -> Result<String, AiError> {
+        match tool_call.function.name.as_str() {
+            "web_search" => {
+                let args: WebSearchToolArgs = serde_json::from_str(&tool_call.function.arguments)?;
+                let query = sanitize_search_query(args.query, args.queries, 300);
+                if query.is_empty() {
+                    return Ok(json!({
+                        "error": "query must contain at least one concrete search query"
+                    })
+                    .to_string());
+                }
+
+                let mut results = self.run_search_query(search_runtime, &query).await?;
+                dedupe_sources(&mut results);
+                Ok(serde_json::to_string(&json!({
+                    "purpose": args.purpose,
+                    "query": query,
+                    "results": results
+                }))?)
+            }
+            "web_fetch" => {
+                let args: WebFetchToolArgs = serde_json::from_str(&tool_call.function.arguments)?;
+                let urls = sanitize_urls(args.urls, 5);
+                if urls.is_empty() {
+                    return Ok(json!({
+                        "error": "urls must contain at least one http(s) URL"
+                    })
+                    .to_string());
+                }
+
+                let pages = self
+                    .run_fetch_urls(search_runtime.jina_key.as_deref(), &urls)
+                    .await?;
+                Ok(serde_json::to_string(&json!({
+                    "purpose": args.purpose,
+                    "urls": urls,
+                    "pages": pages
+                }))?)
+            }
+            _ => Ok(json!({
+                "error": format!("unsupported tool: {}", tool_call.function.name)
+            })
+            .to_string()),
+        }
     }
 }
 
@@ -398,8 +997,247 @@ fn require_model(settings: &ApiSettings) -> Result<String, AiError> {
     Ok(model.to_string())
 }
 
+fn search_tool_runtime(settings: &ApiSettings) -> Option<SearchToolRuntime> {
+    let bocha_key = non_empty_string(&settings.bocha_api_key);
+    let tavily_key = non_empty_string(&settings.tavily_api_key);
+    let tavily_base_url = settings.tavily_base_url.trim();
+    let jina_key = non_empty_string(&settings.jina_api_key);
+    if bocha_key.is_none() && tavily_key.is_none() && jina_key.is_none() {
+        return None;
+    }
+
+    Some(SearchToolRuntime {
+        bocha_key,
+        tavily_key,
+        tavily_base_url: if tavily_base_url.is_empty() {
+            default_tavily_base_url()
+        } else {
+            tavily_base_url.to_string()
+        },
+        jina_key,
+    })
+}
+
+fn non_empty_string(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn chat_completion_payload(
+    model: &str,
+    messages: &[ChatMessageWire],
+    json_response: bool,
+    deepseek_thinking: bool,
+    search_runtime: Option<&SearchToolRuntime>,
+) -> Value {
+    let mut payload = json!({
+        "model": model,
+        "messages": messages
+    });
+
+    if deepseek_thinking {
+        payload["thinking"] = json!({ "type": "enabled" });
+        payload["reasoning_effort"] = json!("high");
+    } else {
+        payload["temperature"] = json!(0.2);
+    }
+
+    if json_response {
+        payload["response_format"] = json!({ "type": "json_object" });
+    }
+
+    if let Some(search_runtime) = search_runtime {
+        let mut tools = Vec::new();
+        if search_runtime.has_search_provider() {
+            tools.push(web_search_tool_definition(search_runtime));
+        }
+        tools.push(web_fetch_tool_definition());
+        if !tools.is_empty() {
+            payload["tools"] = json!(tools);
+            payload["tool_choice"] = json!("auto");
+        }
+    }
+
+    payload
+}
+
+fn json_repair_schema(label: &str) -> &'static str {
+    if label.starts_with("concept.explain") {
+        r#"{
+  "topic_title": string | null,
+  "explanation": string,
+  "concept": {
+    "title": string,
+    "language": string,
+    "summary": string,
+    "key_points": string[]
+  }
+}"#
+    } else if label.starts_with("exercise.generate_one") {
+        r#"{
+  "kind": "short_answer" | "code_prediction" | "fill_in_blank" | "debugging" | "implementation" | "concept_map",
+  "title": string,
+  "prompt": string,
+  "starter_code": string,
+  "expected_answer": string,
+  "hints": string[],
+  "difficulty": "easy" | "medium" | "hard"
+}"#
+    } else if label.starts_with("exercise.validate_one")
+        || label.starts_with("review.exercise_gate")
+    {
+        r#"{
+  "verdict": string,
+  "checked_claims": string[],
+  "blocking_issues": string[],
+  "risk_notes": string[]
+}"#
+    } else if label.starts_with("review") {
+        r#"{
+  "is_correct": boolean,
+  "score": number,
+  "summary": string,
+  "mistakes": string[],
+  "corrected_answer": string,
+  "next_steps": string[]
+}"#
+    } else if label.starts_with("experiment_prompt") {
+        r#"{
+  "title": string,
+  "prompt": string
+}"#
+    } else {
+        "A single valid JSON object matching the original requested schema."
+    }
+}
+
+fn web_search_tool_definition(search_runtime: &SearchToolRuntime) -> Value {
+    let providers = search_runtime.provider_names().join(", ");
+    json!({
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": format!("Search the web with one configured provider ({providers}). Use this before making version-sensitive, library-specific, API-specific, or non-obvious factual claims. Send one concise search query containing multiple keywords; do not send multiple separate queries. Inspect returned source URLs, and call web_fetch for primary or disputed sources when available."),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "One keyword-rich search query. Put multiple keywords in this single string; do not create an array of separate searches."
+                    },
+                    "purpose": {
+                        "type": "string",
+                        "description": "Short reason for this search round."
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    })
+}
+
+fn web_fetch_tool_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "web_fetch",
+            "description": "Fetch readable markdown content from specific source URLs with Jina Reader. Public no-key Reader is used first and requests are rate-limited; a configured Jina API key is only used as fallback after public auth/rate-limit failures. Use this after web_search when a snippet is not enough to verify a claim, especially for official docs, API references, release notes, and disputed facts.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "urls": {
+                        "type": "array",
+                        "description": "1 to 5 http(s) URLs to read. Prefer official documentation or primary sources from search results.",
+                        "items": { "type": "string" }
+                    },
+                    "purpose": {
+                        "type": "string",
+                        "description": "Short reason for fetching these sources."
+                    }
+                },
+                "required": ["urls"]
+            }
+        }
+    })
+}
+
+impl SearchToolRuntime {
+    fn provider_names(&self) -> Vec<&'static str> {
+        let mut providers = Vec::new();
+        if self.bocha_key.is_some() {
+            providers.push("Bocha");
+        }
+        if self.tavily_key.is_some() {
+            providers.push("Tavily");
+        }
+        providers
+    }
+
+    fn has_search_provider(&self) -> bool {
+        self.tavily_key.is_some() || self.bocha_key.is_some()
+    }
+
+    fn search_providers(&self) -> Vec<SearchProvider<'_>> {
+        let mut providers = Vec::new();
+        if let Some(api_key) = self.tavily_key.as_deref() {
+            providers.push(SearchProvider::Tavily {
+                api_key,
+                base_url: &self.tavily_base_url,
+            });
+        }
+        if let Some(api_key) = self.bocha_key.as_deref() {
+            providers.push(SearchProvider::Bocha { api_key });
+        }
+        providers
+    }
+}
+
+enum SearchProvider<'a> {
+    Tavily { api_key: &'a str, base_url: &'a str },
+    Bocha { api_key: &'a str },
+}
+
+impl SearchProvider<'_> {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Tavily { .. } => "Tavily",
+            Self::Bocha { .. } => "Bocha",
+        }
+    }
+}
+
+fn fallback_search_note(query: &str, provider_name: &str, failures: &[String]) -> SearchResultWire {
+    SearchResultWire {
+        provider: "Search fallback".to_string(),
+        query: query.to_string(),
+        title: format!("Using {provider_name} after another search provider failed"),
+        url: "local://search-fallback".to_string(),
+        snippet: format!(
+            "Search continued with {provider_name}. Earlier provider failures: {}",
+            failures.join("; ")
+        ),
+    }
+}
+
 fn normalize_base_url(base_url: &str) -> String {
     base_url.trim().trim_end_matches('/').to_string()
+}
+
+fn default_tavily_base_url() -> String {
+    "https://api.tavily.com".to_string()
+}
+
+fn tavily_search_url(base_url: &str) -> String {
+    let base_url = normalize_base_url(base_url);
+    if base_url.ends_with("/search") {
+        base_url
+    } else {
+        format!("{base_url}/search")
+    }
 }
 
 fn is_deepseek_base_url(base_url: &str) -> bool {
@@ -440,6 +1278,10 @@ fn log_ai_parse_repair(raw: &str, repaired: &str) {
 }
 
 fn log_ai_event(label: &str, kind: &str, body: &str) {
+    if !ai_debug_enabled() {
+        return;
+    }
+
     let timestamp = unix_timestamp_secs();
     let entry = format!(
         "\n===== AI {kind} [{label}] {timestamp} =====\n{body}\n===== end AI {kind} [{label}] =====\n"
@@ -459,6 +1301,15 @@ fn log_ai_event(label: &str, kind: &str, body: &str) {
 
 fn redact_payload(payload: &Value) -> String {
     serde_json::to_string_pretty(payload).unwrap_or_else(|_| "<failed to serialize payload>".into())
+}
+
+fn ai_debug_enabled() -> bool {
+    matches!(
+        std::env::var("LEARNING_DRILL_LAB_AI_DEBUG")
+            .unwrap_or_default()
+            .as_str(),
+        "1" | "true" | "TRUE" | "yes" | "YES"
+    )
 }
 
 fn unix_timestamp_secs() -> u64 {
@@ -483,6 +1334,61 @@ async fn ensure_success(response: reqwest::Response) -> Result<reqwest::Response
         .await
         .unwrap_or_else(|_| "<failed to read body>".to_string());
     Err(AiError::Http { status, body })
+}
+
+async fn ensure_success_labeled(
+    label: &str,
+    response: reqwest::Response,
+) -> Result<reqwest::Response, AiError> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let body = response
+        .text()
+        .await
+        .unwrap_or_else(|_| "<failed to read body>".to_string());
+    Err(AiError::LabeledHttp {
+        label: label.to_string(),
+        status,
+        body,
+    })
+}
+
+#[derive(Debug)]
+struct HttpStatusError {
+    status: StatusCode,
+    body: String,
+}
+
+impl From<reqwest::Error> for HttpStatusError {
+    fn from(error: reqwest::Error) -> Self {
+        Self {
+            status: error.status().unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            body: error.to_string(),
+        }
+    }
+}
+
+async fn ensure_success_status(
+    response: reqwest::Response,
+) -> Result<reqwest::Response, HttpStatusError> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let body = response
+        .text()
+        .await
+        .unwrap_or_else(|_| "<failed to read body>".to_string());
+    Err(HttpStatusError { status, body })
+}
+
+fn should_retry_jina_with_key(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS
+    )
 }
 
 fn strip_json_fences(raw: &str) -> String {
@@ -596,31 +1502,60 @@ struct ModelInfo {
     id: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct ChatMessageWire {
     role: String,
-    content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<ToolCallWire>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
 }
 
 impl ChatMessageWire {
     fn system(content: impl Into<String>) -> Self {
         Self {
             role: "system".to_string(),
-            content: content.into(),
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
         }
     }
 
     fn user(content: impl Into<String>) -> Self {
         Self {
             role: "user".to_string(),
-            content: content.into(),
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
         }
     }
 
     fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: "assistant".to_string(),
-            content: content.into(),
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    fn assistant_with_tool_calls(content: Option<String>, tool_calls: Vec<ToolCallWire>) -> Self {
+        Self {
+            role: "assistant".to_string(),
+            content: Some(content.unwrap_or_default()),
+            tool_calls: Some(tool_calls),
+            tool_call_id: None,
+        }
+    }
+
+    fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: "tool".to_string(),
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: Some(tool_call_id.into()),
         }
     }
 
@@ -650,6 +1585,21 @@ struct ChatMessageContent {
     content: Option<String>,
     #[serde(default)]
     reasoning_content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ToolCallWire>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ToolCallWire {
+    id: String,
+    r#type: String,
+    function: ToolFunctionCallWire,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ToolFunctionCallWire {
+    name: String,
+    arguments: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -763,6 +1713,229 @@ struct ExperimentPromptWire {
     prompt: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SearchResultWire {
+    provider: String,
+    query: String,
+    title: String,
+    url: String,
+    snippet: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FetchedPageWire {
+    provider: String,
+    url: String,
+    content: String,
+    truncated: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebSearchToolArgs {
+    #[serde(default)]
+    query: String,
+    #[serde(default, deserialize_with = "deserialize_query_terms")]
+    queries: Vec<String>,
+    #[serde(default)]
+    purpose: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebFetchToolArgs {
+    #[serde(default, deserialize_with = "deserialize_string_list")]
+    urls: Vec<String>,
+    #[serde(default)]
+    purpose: String,
+}
+
+fn deserialize_string_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(string_list_from_value(&value))
+}
+
+fn deserialize_query_terms<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(query_terms_from_value(&value))
+}
+
+fn string_list_from_value(value: &Value) -> Vec<String> {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| match item {
+                Value::String(value) => Some(value.clone()),
+                Value::Null => None,
+                other => Some(other.to_string()),
+            })
+            .collect(),
+        Value::String(value) => split_delimited_string_list(value),
+        Value::Null => Vec::new(),
+        other => vec![other.to_string()],
+    }
+}
+
+fn query_terms_from_value(value: &Value) -> Vec<String> {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| match item {
+                Value::String(value) => Some(value.clone()),
+                Value::Null => None,
+                other => Some(other.to_string()),
+            })
+            .collect(),
+        Value::String(value) => vec![value.clone()],
+        Value::Null => Vec::new(),
+        other => vec![other.to_string()],
+    }
+}
+
+fn split_delimited_string_list(value: &str) -> Vec<String> {
+    value
+        .split(|ch| ch == ',' || ch == '\n')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn sanitize_search_query(query: String, query_terms: Vec<String>, max_chars: usize) -> String {
+    let raw_query = if query.trim().is_empty() {
+        query_terms.join(" ")
+    } else {
+        query
+    };
+    let normalized = raw_query
+        .replace([',', '\n', '\r', '\t'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    truncate_text(&normalized, max_chars).0
+}
+
+fn sanitize_urls(urls: Vec<String>, limit: usize) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut output = Vec::new();
+    for url in urls {
+        let url = url.trim().to_string();
+        let lower = url.to_lowercase();
+        if !(lower.starts_with("https://") || lower.starts_with("http://")) {
+            continue;
+        }
+        if !seen.insert(lower) {
+            continue;
+        }
+        output.push(url);
+        if output.len() >= limit {
+            break;
+        }
+    }
+    output
+}
+
+fn parse_bocha_results(query: &str, body: &Value) -> Vec<SearchResultWire> {
+    let mut results = Vec::new();
+    collect_bocha_array(query, &body["webPages"]["value"], &mut results);
+    collect_bocha_array(query, &body["data"]["webPages"]["value"], &mut results);
+    collect_bocha_array(query, &body["data"]["results"], &mut results);
+    collect_bocha_array(query, &body["results"], &mut results);
+    dedupe_sources(&mut results);
+    results
+}
+
+fn collect_bocha_array(query: &str, value: &Value, results: &mut Vec<SearchResultWire>) {
+    let Some(items) = value.as_array() else {
+        return;
+    };
+    for item in items {
+        let title = first_string(item, &["name", "title"]);
+        let url = first_string(item, &["url", "link"]);
+        if title.is_empty() || url.is_empty() {
+            continue;
+        }
+        let snippet = first_string(item, &["summary", "snippet", "content", "description"]);
+        results.push(SearchResultWire {
+            provider: "Bocha".to_string(),
+            query: query.to_string(),
+            title,
+            url,
+            snippet: truncate_text(&snippet, 2_000).0,
+        });
+    }
+}
+
+fn parse_tavily_results(query: &str, body: &Value) -> Vec<SearchResultWire> {
+    let mut results = Vec::new();
+    if let Some(answer) = body["answer"]
+        .as_str()
+        .filter(|answer| !answer.trim().is_empty())
+    {
+        results.push(SearchResultWire {
+            provider: "Tavily".to_string(),
+            query: query.to_string(),
+            title: "Tavily answer summary".to_string(),
+            url: "tavily://answer".to_string(),
+            snippet: truncate_text(answer.trim(), 2_000).0,
+        });
+    }
+
+    let Some(items) = body["results"].as_array() else {
+        return results;
+    };
+    for item in items {
+        let title = first_string(item, &["title", "name"]);
+        let url = first_string(item, &["url", "link"]);
+        if title.is_empty() || url.is_empty() {
+            continue;
+        }
+        let snippet = first_string(item, &["content", "snippet", "summary", "description"]);
+        results.push(SearchResultWire {
+            provider: "Tavily".to_string(),
+            query: query.to_string(),
+            title,
+            url,
+            snippet: truncate_text(&snippet, 2_000).0,
+        });
+    }
+    dedupe_sources(&mut results);
+    results
+}
+
+fn first_string(item: &Value, keys: &[&str]) -> String {
+    keys.iter()
+        .find_map(|key| item.get(*key).and_then(Value::as_str))
+        .map(|value| value.trim().to_string())
+        .unwrap_or_default()
+}
+
+fn dedupe_sources(results: &mut Vec<SearchResultWire>) {
+    let mut seen = HashSet::new();
+    results.retain(|result| seen.insert(result.url.to_lowercase()));
+}
+
+fn jina_reader_url(url: &str) -> String {
+    format!("https://r.jina.ai/{}", url.trim())
+}
+
+fn truncate_text(value: &str, max_chars: usize) -> (String, bool) {
+    let mut output = String::new();
+    let mut truncated = false;
+    for (index, ch) in value.chars().enumerate() {
+        if index >= max_chars {
+            truncated = true;
+            break;
+        }
+        output.push(ch);
+    }
+    (output, truncated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -795,5 +1968,166 @@ mod tests {
             parse_ai_json(raw).expect("fenced json should be stripped and repaired");
 
         assert_eq!(parsed["path"], "C:\\model\\weights");
+    }
+
+    #[test]
+    fn parse_bocha_results_reads_top_level_web_pages() {
+        let body = json!({
+            "webPages": {
+                "value": [
+                    {
+                        "name": "Dioxus signals",
+                        "url": "https://dioxuslabs.com/docs",
+                        "summary": "Signals are owned by a scope."
+                    }
+                ]
+            }
+        });
+
+        let results = parse_bocha_results("dioxus signal scope", &body);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].provider, "Bocha");
+        assert_eq!(results[0].title, "Dioxus signals");
+        assert_eq!(results[0].snippet, "Signals are owned by a scope.");
+    }
+
+    #[test]
+    fn parse_tavily_results_reads_content_snippet() {
+        let body = json!({
+            "answer": "short summary",
+            "results": [
+                {
+                    "title": "Tavily Search API",
+                    "url": "https://docs.tavily.com/documentation/api-reference/endpoint/search",
+                    "content": "The search endpoint returns ranked results."
+                }
+            ]
+        });
+
+        let results = parse_tavily_results("tavily search api", &body);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[1].provider, "Tavily");
+        assert_eq!(results[1].title, "Tavily Search API");
+        assert_eq!(
+            results[1].snippet,
+            "The search endpoint returns ranked results."
+        );
+    }
+
+    #[test]
+    fn web_search_args_accept_legacy_queries_but_build_one_search_query() {
+        let args: WebSearchToolArgs = serde_json::from_str(
+            r#"{"queries":"UE5 Gameplay Ability System GAS overview,Unreal Engine 5 GAS documentation,GameplayAbilitySystem UE5 official docs","purpose":"verify GAS docs"}"#,
+        )
+        .expect("comma-separated query string should be accepted");
+
+        assert_eq!(
+            args.queries,
+            vec!["UE5 Gameplay Ability System GAS overview,Unreal Engine 5 GAS documentation,GameplayAbilitySystem UE5 official docs".to_string()]
+        );
+        assert_eq!(
+            sanitize_search_query(args.query, args.queries, 300),
+            "UE5 Gameplay Ability System GAS overview Unreal Engine 5 GAS documentation GameplayAbilitySystem UE5 official docs"
+        );
+        assert_eq!(args.purpose, "verify GAS docs");
+    }
+
+    #[test]
+    fn web_search_args_prefer_single_query_field() {
+        let args: WebSearchToolArgs = serde_json::from_str(
+            r#"{"query":"UE5 GAS GameplayAbility official docs","queries":["should","not","matter"]}"#,
+        )
+        .expect("single query field should be accepted");
+
+        assert_eq!(
+            sanitize_search_query(args.query, args.queries, 300),
+            "UE5 GAS GameplayAbility official docs"
+        );
+    }
+
+    #[test]
+    fn web_fetch_args_accept_newline_separated_url_string() {
+        let args: WebFetchToolArgs = serde_json::from_str(
+            "{\"urls\":\"https://example.com/docs\\nhttps://example.com/api\"}",
+        )
+        .expect("newline-separated url string should be accepted");
+
+        assert_eq!(
+            args.urls,
+            vec![
+                "https://example.com/docs".to_string(),
+                "https://example.com/api".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn sanitize_urls_keeps_only_unique_http_urls() {
+        let urls = sanitize_urls(
+            vec![
+                " https://example.com/docs ".to_string(),
+                "HTTPS://example.com/docs".to_string(),
+                "file:///tmp/a".to_string(),
+                "http://example.com/api".to_string(),
+            ],
+            5,
+        );
+
+        assert_eq!(
+            urls,
+            vec![
+                "https://example.com/docs".to_string(),
+                "http://example.com/api".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn tavily_search_url_supports_official_and_proxy_base_urls() {
+        assert_eq!(
+            tavily_search_url("https://api.tavily.com"),
+            "https://api.tavily.com/search"
+        );
+        assert_eq!(
+            tavily_search_url("https://tavily-proxy.example.com/api/tavily"),
+            "https://tavily-proxy.example.com/api/tavily/search"
+        );
+        assert_eq!(
+            tavily_search_url("https://tavily-proxy.example.com/api/tavily/search"),
+            "https://tavily-proxy.example.com/api/tavily/search"
+        );
+    }
+
+    #[test]
+    fn jina_key_does_not_enable_search_provider() {
+        let runtime = SearchToolRuntime {
+            bocha_key: None,
+            tavily_key: None,
+            tavily_base_url: default_tavily_base_url(),
+            jina_key: Some("jina_test".to_string()),
+        };
+
+        assert!(!runtime.has_search_provider());
+        assert!(runtime.search_providers().is_empty());
+        assert!(runtime.provider_names().is_empty());
+    }
+
+    #[test]
+    fn search_providers_try_tavily_then_bocha() {
+        let runtime = SearchToolRuntime {
+            bocha_key: Some("bocha_test".to_string()),
+            tavily_key: Some("tavily_test".to_string()),
+            tavily_base_url: default_tavily_base_url(),
+            jina_key: None,
+        };
+        let names = runtime
+            .search_providers()
+            .iter()
+            .map(SearchProvider::name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["Tavily", "Bocha"]);
     }
 }

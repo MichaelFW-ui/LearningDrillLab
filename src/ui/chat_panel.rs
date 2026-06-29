@@ -1,8 +1,8 @@
 use crate::app::{
     begin_rename_topic, cancel_rename_topic, commit_rename_topic, delete_topic,
     follow_up_from_chat_input, generate_from_chat_input, new_topic, regenerate_from_topic,
-    set_topic_sort, switch_topic, update_chat_input, update_rename_input, APP_STATE, ChatRole,
-    TopicSort,
+    set_topic_sort, switch_topic, update_chat_input, update_rename_input, ChatRole, TopicSort,
+    APP_STATE,
 };
 use dioxus::prelude::*;
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag};

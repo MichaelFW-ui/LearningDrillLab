@@ -361,6 +361,30 @@ textarea:focus, input:focus, select:focus {
   padding: 12px;
 }
 
+.source-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.source-item {
+  border: 1px solid #d9ded9;
+  border-radius: 8px;
+  padding: 10px;
+  background: #ffffff;
+}
+
+.source-item a {
+  color: #1f6f61;
+  font-weight: 650;
+}
+
+.source-meta {
+  color: #69726c;
+  font-size: 12px;
+  margin-top: 4px;
+}
+
 .settings-page {
   max-width: 880px;
   width: 100%;
@@ -474,6 +498,17 @@ pub fn App() -> Element {
 fn SettingsPage() -> Element {
     let snapshot = APP_STATE.read().clone();
     let selected_model = snapshot.settings.selected_model.clone();
+    let settings_path = storage_path_text();
+    let key_input_type = if snapshot.show_api_keys {
+        "text"
+    } else {
+        "password"
+    };
+    let key_toggle_label = if snapshot.show_api_keys {
+        "隐藏 Key"
+    } else {
+        "显示 Key"
+    };
 
     rsx! {
         div { class: "settings-page",
@@ -491,10 +526,37 @@ fn SettingsPage() -> Element {
                     }
                     label { "API Key" }
                     input {
-                        r#type: "password",
+                        r#type: "{key_input_type}",
                         value: "{snapshot.settings.api_key}",
                         placeholder: "sk-...",
                         oninput: move |event| update_api_key(event.value())
+                    }
+                    label { "博查 API Key" }
+                    input {
+                        r#type: "{key_input_type}",
+                        value: "{snapshot.settings.bocha_api_key}",
+                        placeholder: "sk-...",
+                        oninput: move |event| update_bocha_api_key(event.value())
+                    }
+                    label { "Tavily API Key" }
+                    input {
+                        r#type: "{key_input_type}",
+                        value: "{snapshot.settings.tavily_api_key}",
+                        placeholder: "tvly-...",
+                        oninput: move |event| update_tavily_api_key(event.value())
+                    }
+                    label { "Tavily HTTP Base URL" }
+                    input {
+                        value: "{snapshot.settings.tavily_base_url}",
+                        placeholder: "https://your-tavily-proxy.example.com/api/tavily",
+                        oninput: move |event| update_tavily_base_url(event.value())
+                    }
+                    label { "Jina API Key（限流备用）" }
+                    input {
+                        r#type: "{key_input_type}",
+                        value: "{snapshot.settings.jina_api_key}",
+                        placeholder: "jina_...",
+                        oninput: move |event| update_jina_api_key(event.value())
                     }
                     label { "模型" }
                     select {
@@ -514,6 +576,10 @@ fn SettingsPage() -> Element {
                 }
                 div { class: "form-actions",
                     button {
+                        onclick: move |_| toggle_show_api_keys(),
+                        "{key_toggle_label}"
+                    }
+                    button {
                         onclick: move |_| fetch_models(),
                         disabled: snapshot.is_busy(),
                         "拉取模型列表"
@@ -525,7 +591,10 @@ fn SettingsPage() -> Element {
                     }
                 }
                 p { class: "muted",
-                    "Base URL 请填写包含版本路径的地址，例如 https://api.openai.com/v1。模型列表通过 GET /models 获取。"
+                    "Base URL 请填写包含版本路径的地址，例如 https://api.openai.com/v1。Tavily HTTP Base URL 默认 https://api.tavily.com；使用中转站时填 Tavily 风格 HTTP API 基础地址，不要填 MCP 地址。也支持直接填到 /search。Bocha 或 Tavily API Key 会启用联网搜索；Jina Reader 默认无 Key 读取网页正文并按 20 RPM 控速，只有遇到 public Reader 鉴权或限流失败时才使用 Jina API Key 备用，不用于 Jina Search。"
+                }
+                p { class: "muted",
+                    "本地配置文件：{settings_path}"
                 }
             }
         }
@@ -534,21 +603,45 @@ fn SettingsPage() -> Element {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApiSettings {
+    #[serde(default = "default_base_url")]
     pub base_url: String,
+    #[serde(default)]
     pub api_key: String,
+    #[serde(default)]
     pub selected_model: String,
+    #[serde(default)]
     pub available_models: Vec<String>,
+    #[serde(default)]
+    pub bocha_api_key: String,
+    #[serde(default)]
+    pub tavily_api_key: String,
+    #[serde(default = "default_tavily_base_url")]
+    pub tavily_base_url: String,
+    #[serde(default)]
+    pub jina_api_key: String,
 }
 
 impl Default for ApiSettings {
     fn default() -> Self {
         Self {
-            base_url: "https://api.openai.com/v1".to_string(),
+            base_url: default_base_url(),
             api_key: String::new(),
             selected_model: String::new(),
             available_models: Vec::new(),
+            bocha_api_key: String::new(),
+            tavily_api_key: String::new(),
+            tavily_base_url: default_tavily_base_url(),
+            jina_api_key: String::new(),
         }
     }
+}
+
+fn default_base_url() -> String {
+    "https://api.openai.com/v1".to_string()
+}
+
+fn default_tavily_base_url() -> String {
+    "https://api.tavily.com".to_string()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -688,6 +781,8 @@ pub struct AppState {
     pub error: Option<String>,
     #[serde(skip)]
     pub status: Option<String>,
+    #[serde(skip)]
+    pub show_api_keys: bool,
 }
 
 impl Default for AppState {
@@ -705,6 +800,7 @@ impl Default for AppState {
             loading: None,
             error: None,
             status: None,
+            show_api_keys: false,
         };
         state.ensure_active_topic();
         state
@@ -730,6 +826,7 @@ impl AppState {
         state.loading = None;
         state.error = None;
         state.status = Some("已加载本地历史记录".to_string());
+        state.show_api_keys = false;
         state.ensure_active_topic();
         state
     }
@@ -806,6 +903,27 @@ pub fn update_api_key(value: String) {
     APP_STATE.write().settings.api_key = value;
 }
 
+pub fn toggle_show_api_keys() {
+    let mut app = APP_STATE.write();
+    app.show_api_keys = !app.show_api_keys;
+}
+
+pub fn update_bocha_api_key(value: String) {
+    APP_STATE.write().settings.bocha_api_key = value;
+}
+
+pub fn update_tavily_api_key(value: String) {
+    APP_STATE.write().settings.tavily_api_key = value;
+}
+
+pub fn update_tavily_base_url(value: String) {
+    APP_STATE.write().settings.tavily_base_url = value;
+}
+
+pub fn update_jina_api_key(value: String) {
+    APP_STATE.write().settings.jina_api_key = value;
+}
+
 pub fn select_model(value: String) {
     {
         let mut app = APP_STATE.write();
@@ -835,6 +953,18 @@ pub fn save_settings() {
             .trim()
             .trim_end_matches('/')
             .to_string();
+        app.settings.bocha_api_key = app.settings.bocha_api_key.trim().to_string();
+        app.settings.tavily_api_key = app.settings.tavily_api_key.trim().to_string();
+        app.settings.tavily_base_url = app
+            .settings
+            .tavily_base_url
+            .trim()
+            .trim_end_matches('/')
+            .to_string();
+        if app.settings.tavily_base_url.is_empty() {
+            app.settings.tavily_base_url = default_tavily_base_url();
+        }
+        app.settings.jina_api_key = app.settings.jina_api_key.trim().to_string();
         app.status = Some("设置已保存到本地".to_string());
         app.error = None;
     }
@@ -1362,6 +1492,12 @@ pub fn persist_signal() {
 fn storage_path() -> Option<PathBuf> {
     ProjectDirs::from("dev", "LearningDrillLab", "LearningDrillLab")
         .map(|dirs| dirs.config_dir().join("state.json"))
+}
+
+fn storage_path_text() -> String {
+    storage_path()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "无法确定本地配置路径".to_string())
 }
 
 fn normalized_title(ai_title: Option<&str>, concept_title: &str) -> Option<String> {
