@@ -1,4 +1,4 @@
-use crate::ai::client::AiClient;
+use crate::ai::client::{AiClient, ProgressReporter};
 use crate::domain::concept::Concept;
 use crate::domain::exercise::{Attempt, Exercise, ExperimentPrompt};
 use crate::ui::chat_panel::ChatPanel;
@@ -10,6 +10,7 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 use uuid::Uuid;
 
 pub(crate) static APP_STATE: GlobalSignal<AppState> = Signal::global(AppState::load);
@@ -1292,12 +1293,14 @@ pub fn regenerate_from_topic() {
     persist_signal();
 
     spawn_forever(async move {
+        let progress = generation_progress_reporter(topic_id);
         let result = AiClient::default()
             .regenerate_exercises(
                 &settings,
                 &concept,
                 &explanation_context,
                 &previous_exercises,
+                Some(progress),
             )
             .await;
         match result {
@@ -1356,8 +1359,9 @@ fn start_learning_generation() {
     persist_signal();
 
     spawn_forever(async move {
+        let progress = generation_progress_reporter(topic_id);
         let result = AiClient::default()
-            .explain_and_generate(&settings, &topic_text)
+            .explain_and_generate(&settings, &topic_text, Some(progress))
             .await;
         match result {
             Ok(response) => {
@@ -1604,6 +1608,15 @@ pub fn persist_signal() {
     if let Err(error) = snapshot.save() {
         APP_STATE.write().error = Some(format!("保存本地历史失败：{error}"));
     }
+}
+
+fn generation_progress_reporter(topic_id: Uuid) -> ProgressReporter {
+    Arc::new(move |message| {
+        let mut app = APP_STATE.write();
+        if app.active_topic_id == Some(topic_id) && app.loading.is_some() {
+            app.loading = Some(message);
+        }
+    })
 }
 
 fn storage_path() -> Option<PathBuf> {

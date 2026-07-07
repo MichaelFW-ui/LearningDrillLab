@@ -89,7 +89,7 @@ Return JSON with this exact shape:
 {{
   "kind": "FillBlank | FixBug | WriteFromScratch | PredictCompileResult",
   "title": "exercise title",
-  "prompt": "question in Chinese. Do not repeat starter_code here.",
+  "prompt": "question in Chinese. It must be self-contained together with starter_code. Do not repeat starter_code here.",
   "starter_code": "code or empty string",
   "expected_answer": "reference answer",
   "hints": ["hint 1"],
@@ -106,6 +106,11 @@ Exercise design rules:
 - Use FixBug only when the bug is visible in starter_code and the prompt can be answered without relying on hidden requirements.
 - The prompt and expected_answer must be aligned. Hints must not add requirements that are absent from the prompt.
 - Stay inside the explanation/context source of truth. Do not require niche facts that were not taught.
+- The exercise JSON must be complete enough to grade by itself. A reviewer who sees only title, prompt, starter_code, expected_answer, hints, and difficulty must not need Concept JSON, explanation/context, prior chat, or hidden implementation details.
+- If the exercise uses a custom type, function, class, trait, module, scheduler, dispatcher, hook, helper, or mock API, include the complete minimal definition or contract in starter_code or prompt. Do not reference names such as TaskDispatcher, enqueue, render, store, client, or service unless their relevant behavior is explicitly specified in the exercise JSON.
+- If the answer depends on ordering, sync vs async behavior, mutability, ownership, lifetime, concurrency, errors, side effects, or state transitions, make that behavior observable with starter_code, explicit assertions, printed output, or a stated contract.
+- For code-centered exercises, starter_code should be a minimal complete reproduction: include needed imports, definitions, sample inputs, placeholders, and observable assertions/output. If starter_code is empty, prompt must fully define the scenario and all assumptions needed to answer.
+- The expected_answer must not rely on hidden reference code, unstated implementation choices, or facts that are only present in the explanation/context.
 - This is attempt {attempt} for slot {slot}; avoid patterns already rejected above.
 - In prompt, expected_answer, and hints, write math only as dollar-delimited LaTeX: inline math as $a + b$ and display math as $$\sum_i x_i$$ on its own line. Do not use \( ... \), \[ ... \], bare LaTeX, Unicode-only pseudo-formulas, or fenced code blocks for math unless you are showing source code.
 - Return only valid JSON. Do not wrap JSON in markdown fences."#
@@ -155,6 +160,10 @@ Validation rules:
 - Reject if the prompt, starter_code, hints, or expected_answer contain a factual claim you cannot actively justify from language/library semantics.
 - Reject if the exercise depends on an unstated version, environment, installed package, file system, network, hardware device, or hidden setup.
 - Reject if the prompt says code fails, cannot compile, must throw, or requires a specific repair, unless the starter_code and expected_answer make that premise concrete and self-contained.
+- Reject if the exercise is not self-contained enough to grade from Exercise JSON alone. Do not accept an exercise that requires Concept JSON, explanation/context, prior chat, hidden reference code, or unstated implementation details to know what the correct answer means.
+- Reject if any custom type, function, class, trait, module, scheduler, dispatcher, hook, helper, or mock API is referenced without a complete minimal definition or explicit behavioral contract in prompt or starter_code.
+- Reject if the answer depends on ordering, sync vs async behavior, mutability, ownership, lifetime, concurrency, errors, side effects, or state transitions that are not made observable by starter_code, assertions, printed output, or an explicit stated contract.
+- Reject code-centered exercises whose starter_code omits imports, definitions, sample inputs, placeholders, assertions/output, or other material required to reproduce the premise.
 - Reject if expected_answer answers a different question than the prompt asks.
 - Reject if hints smuggle extra requirements.
 - Reject if the exercise requires facts outside the explanation/context source of truth.

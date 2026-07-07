@@ -10,8 +10,11 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+
+pub type ProgressReporter = Arc<dyn Fn(String) + Send + Sync + 'static>;
 
 #[derive(Debug, Error)]
 pub enum AiError {
@@ -86,7 +89,9 @@ impl AiClient {
         &self,
         settings: &ApiSettings,
         topic: &str,
+        progress: Option<ProgressReporter>,
     ) -> Result<ExplainAndGenerateResponse, AiError> {
+        report_progress(progress.as_ref(), "正在整理学习目标并生成讲解...");
         let raw = self
             .chat_completion_with_search(
                 "concept.explain",
@@ -96,15 +101,25 @@ impl AiClient {
                     ChatMessageWire::user(prompts::explain_topic_prompt(topic)),
                 ],
                 true,
+                progress.as_ref(),
             )
             .await?;
+        report_progress(progress.as_ref(), "讲解已生成，正在解析结构化内容...");
         let parsed: TopicExplanationWire = self
             .parse_ai_json_or_repair("concept.explain", settings, &raw)
             .await?;
+        report_progress(progress.as_ref(), "讲解解析完成，正在准备生成练习...");
         let concept_json = serde_json::to_string_pretty(&parsed.concept)?;
         let exercises = self
-            .generate_validated_exercises(settings, &concept_json, &parsed.explanation, None)
+            .generate_validated_exercises(
+                settings,
+                &concept_json,
+                &parsed.explanation,
+                None,
+                progress.as_ref(),
+            )
             .await?;
+        report_progress(progress.as_ref(), "练习全部通过审查，正在写入学习会话...");
         let concept = parsed.concept.into_concept();
         let concept_id = concept.id;
         let exercises = exercises
@@ -137,6 +152,7 @@ impl AiClient {
                     ChatMessageWire::user(prompts::review_exercise_gate_prompt(&exercise_json)),
                 ],
                 true,
+                None,
             )
             .await?;
         let validation: ExerciseValidationWire = self
@@ -167,6 +183,7 @@ impl AiClient {
                     ChatMessageWire::user(prompts::review_prompt(&exercise_json, answer)),
                 ],
                 true,
+                None,
             )
             .await?;
         let parsed: ReviewResultWire = self
@@ -181,7 +198,12 @@ impl AiClient {
         concept: &Concept,
         explanation_context: &str,
         previous_exercises: &[Exercise],
+        progress: Option<ProgressReporter>,
     ) -> Result<Vec<Exercise>, AiError> {
+        report_progress(
+            progress.as_ref(),
+            "正在读取当前讲解上下文，准备重新生成练习...",
+        );
         let concept_json = serde_json::to_string_pretty(concept)?;
         let previous_exercises_json = serde_json::to_string_pretty(previous_exercises)?;
         let exercises = self
@@ -190,8 +212,10 @@ impl AiClient {
                 &concept_json,
                 explanation_context,
                 Some(&previous_exercises_json),
+                progress.as_ref(),
             )
             .await?;
+        report_progress(progress.as_ref(), "新练习全部通过审查，正在替换旧练习...");
         Ok(exercises
             .exercises
             .into_iter()
@@ -218,7 +242,7 @@ impl AiClient {
 
         wire_messages.extend(messages.iter().map(ChatMessageWire::from_chat_message));
 
-        self.chat_completion_with_search("follow_up", settings, wire_messages, false)
+        self.chat_completion_with_search("follow_up", settings, wire_messages, false, None)
             .await
     }
 
@@ -256,6 +280,7 @@ impl AiClient {
         concept_json: &str,
         explanation_context: &str,
         previous_exercises_json: Option<&str>,
+        progress: Option<&ProgressReporter>,
     ) -> Result<ExerciseSetWire, AiError> {
         const MAX_ATTEMPTS_PER_SLOT: usize = 3;
         const DIFFICULTY_PLAN: [&str; 4] = ["easy", "medium", "hard", "hard"];
@@ -267,10 +292,24 @@ impl AiClient {
             let slot = accepted.len() + 1;
             let target_difficulty = DIFFICULTY_PLAN[slot - 1];
             let mut accepted_this_slot = false;
+            report_progress(
+                progress,
+                format!(
+                    "正在生成第 {slot}/{} 道练习（难度：{target_difficulty}）...",
+                    DIFFICULTY_PLAN.len()
+                ),
+            );
 
             for attempt in 1..=MAX_ATTEMPTS_PER_SLOT {
                 let accepted_json = serde_json::to_string_pretty(&accepted)?;
                 let rejected_json = serde_json::to_string_pretty(&rejected)?;
+                report_progress(
+                    progress,
+                    format!(
+                        "正在生成第 {slot}/{} 道练习，第 {attempt}/{MAX_ATTEMPTS_PER_SLOT} 次尝试...",
+                        DIFFICULTY_PLAN.len()
+                    ),
+                );
                 let raw = self
                     .chat_completion_with_search(
                         "exercise.generate_one",
@@ -289,12 +328,27 @@ impl AiClient {
                             )),
                         ],
                         true,
+                        progress,
                     )
                     .await?;
+                report_progress(
+                    progress,
+                    format!(
+                        "第 {slot}/{} 道练习已生成，正在解析题目 JSON...",
+                        DIFFICULTY_PLAN.len()
+                    ),
+                );
                 let exercise: ExerciseWire = self
                     .parse_ai_json_or_repair("exercise.generate_one", settings, &raw)
                     .await?;
                 let exercise_json = serde_json::to_string_pretty(&exercise)?;
+                report_progress(
+                    progress,
+                    format!(
+                        "正在审查第 {slot}/{} 道练习是否符合讲解上下文...",
+                        DIFFICULTY_PLAN.len()
+                    ),
+                );
                 let validation_raw = self
                     .chat_completion_with_search(
                         "exercise.validate_one",
@@ -309,6 +363,7 @@ impl AiClient {
                             )),
                         ],
                         true,
+                        progress,
                     )
                     .await?;
                 let validation: ExerciseValidationWire = self
@@ -316,11 +371,62 @@ impl AiClient {
                     .await?;
 
                 if validation.is_accepted() {
+                    report_progress(
+                        progress,
+                        format!(
+                            "第 {slot}/{} 道练习通过上下文审查，正在做展示前可评分性审查...",
+                            DIFFICULTY_PLAN.len()
+                        ),
+                    );
+                    let gate_raw = self
+                        .chat_completion_with_search(
+                            "exercise.review_gate",
+                            settings,
+                            vec![
+                                ChatMessageWire::system(prompts::learning_system_prompt()),
+                                ChatMessageWire::user(prompts::review_exercise_gate_prompt(
+                                    &exercise_json,
+                                )),
+                            ],
+                            true,
+                            progress,
+                        )
+                        .await?;
+                    let gate_validation: ExerciseValidationWire = self
+                        .parse_ai_json_or_repair("exercise.review_gate", settings, &gate_raw)
+                        .await?;
+
+                    if !gate_validation.is_accepted() {
+                        report_progress(
+                            progress,
+                            format!(
+                                "第 {slot}/{} 道练习展示前审查未通过，正在重试生成...",
+                                DIFFICULTY_PLAN.len()
+                            ),
+                        );
+                        rejected.push(RejectedExerciseWire {
+                            exercise,
+                            validation: gate_validation,
+                        });
+                        continue;
+                    }
+
                     accepted.push(exercise);
                     accepted_this_slot = true;
+                    report_progress(
+                        progress,
+                        format!("第 {slot}/{} 道练习已通过全部审查。", DIFFICULTY_PLAN.len()),
+                    );
                     break;
                 }
 
+                report_progress(
+                    progress,
+                    format!(
+                        "第 {slot}/{} 道练习上下文审查未通过，正在重试生成...",
+                        DIFFICULTY_PLAN.len()
+                    ),
+                );
                 rejected.push(RejectedExerciseWire {
                     exercise,
                     validation,
@@ -653,7 +759,7 @@ Malformed assistant output is encoded as this JSON string:
         messages: Vec<ChatMessageWire>,
         json_response: bool,
     ) -> Result<String, AiError> {
-        self.chat_completion_inner(label, settings, messages, json_response, None)
+        self.chat_completion_inner(label, settings, messages, json_response, None, None)
             .await
     }
 
@@ -663,6 +769,7 @@ Malformed assistant output is encoded as this JSON string:
         settings: &ApiSettings,
         messages: Vec<ChatMessageWire>,
         json_response: bool,
+        progress: Option<&ProgressReporter>,
     ) -> Result<String, AiError> {
         let search_runtime = search_tool_runtime(settings);
         self.chat_completion_inner(
@@ -671,6 +778,7 @@ Malformed assistant output is encoded as this JSON string:
             messages,
             json_response,
             search_runtime.as_ref(),
+            progress,
         )
         .await
     }
@@ -682,6 +790,7 @@ Malformed assistant output is encoded as this JSON string:
         mut messages: Vec<ChatMessageWire>,
         json_response: bool,
         search_runtime: Option<&SearchToolRuntime>,
+        progress: Option<&ProgressReporter>,
     ) -> Result<String, AiError> {
         const MAX_TOOL_ROUNDS: usize = 4;
 
@@ -767,7 +876,9 @@ Malformed assistant output is encoded as this JSON string:
                 ));
 
                 for tool_call in tool_calls {
-                    let tool_result = self.execute_tool_call(search_runtime, &tool_call).await?;
+                    let tool_result = self
+                        .execute_tool_call(search_runtime, &tool_call, progress)
+                        .await?;
                     messages.push(ChatMessageWire::tool(tool_call.id, tool_result));
                 }
                 continue;
@@ -934,6 +1045,7 @@ Malformed assistant output is encoded as this JSON string:
         &self,
         search_runtime: &SearchToolRuntime,
         tool_call: &ToolCallWire,
+        progress: Option<&ProgressReporter>,
     ) -> Result<String, AiError> {
         match tool_call.function.name.as_str() {
             "web_search" => {
@@ -946,8 +1058,13 @@ Malformed assistant output is encoded as this JSON string:
                     .to_string());
                 }
 
+                report_progress(progress, format!("正在搜索资料：{query}"));
                 let mut results = self.run_search_query(search_runtime, &query).await?;
                 dedupe_sources(&mut results);
+                report_progress(
+                    progress,
+                    format!("搜索完成，找到 {} 条候选资料。", results.len()),
+                );
                 Ok(serde_json::to_string(&json!({
                     "purpose": args.purpose,
                     "query": query,
@@ -964,9 +1081,14 @@ Malformed assistant output is encoded as this JSON string:
                     .to_string());
                 }
 
+                report_progress(progress, format!("正在抓取资料正文：{} 个 URL", urls.len()));
                 let pages = self
                     .run_fetch_urls(search_runtime.jina_key.as_deref(), &urls)
                     .await?;
+                report_progress(
+                    progress,
+                    format!("资料正文抓取完成：{} 个页面。", pages.len()),
+                );
                 Ok(serde_json::to_string(&json!({
                     "purpose": args.purpose,
                     "urls": urls,
@@ -1024,6 +1146,12 @@ fn non_empty_string(value: &str) -> Option<String> {
         None
     } else {
         Some(value.to_string())
+    }
+}
+
+fn report_progress(progress: Option<&ProgressReporter>, message: impl Into<String>) {
+    if let Some(progress) = progress {
+        progress(message.into());
     }
 }
 
@@ -1088,6 +1216,7 @@ fn json_repair_schema(label: &str) -> &'static str {
   "difficulty": "easy" | "medium" | "hard"
 }"#
     } else if label.starts_with("exercise.validate_one")
+        || label.starts_with("exercise.review_gate")
         || label.starts_with("review.exercise_gate")
     {
         r#"{
