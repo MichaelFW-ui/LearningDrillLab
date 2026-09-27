@@ -1,7 +1,7 @@
 use crate::ai::prompts;
 use crate::app::{ApiSettings, ChatMessage, ChatRole};
 use crate::domain::concept::Concept;
-use crate::domain::exercise::{Exercise, ExerciseKind, ExperimentPrompt};
+use crate::domain::exercise::{Exercise, ExerciseKind, ExperimentPrompt, VerificationEvidence};
 use crate::domain::review::ReviewResult;
 use directories::ProjectDirs;
 use reqwest::StatusCode;
@@ -10,7 +10,10 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
@@ -40,17 +43,21 @@ pub enum AiError {
     Json(#[from] serde_json::Error),
     #[error("AI 质量门未通过: {0}")]
     QualityGateFailed(String),
+    #[error("任务已取消")]
+    Cancelled,
 }
 
 #[derive(Clone)]
 pub struct AiClient {
     http: reqwest::Client,
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl Default for AiClient {
     fn default() -> Self {
         Self {
             http: reqwest::Client::new(),
+            cancel: None,
         }
     }
 }
@@ -73,6 +80,37 @@ struct SearchToolRuntime {
 }
 
 impl AiClient {
+    pub fn with_cancel(mut self, cancel: Arc<AtomicBool>) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    fn check_cancelled(&self) -> Result<(), AiError> {
+        if self
+            .cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            Err(AiError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn send_with_cancel(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, AiError> {
+        self.check_cancelled()?;
+        let Some(cancel) = self.cancel.clone() else {
+            return Ok(request.send().await?);
+        };
+        tokio::select! {
+            response = request.send() => Ok(response?),
+            _ = wait_for_cancel(cancel) => Err(AiError::Cancelled),
+        }
+    }
+
     pub async fn fetch_models(&self, settings: &ApiSettings) -> Result<Vec<String>, AiError> {
         let api_key = require_api_key(settings)?;
         let url = format!("{}/models", normalize_base_url(&settings.base_url));
@@ -283,31 +321,79 @@ impl AiClient {
         progress: Option<&ProgressReporter>,
     ) -> Result<ExerciseSetWire, AiError> {
         const MAX_ATTEMPTS_PER_SLOT: usize = 3;
-        const DIFFICULTY_PLAN: [&str; 4] = ["easy", "medium", "hard", "hard"];
+        const MAX_AGENT_ACTIONS: usize = 8;
+        const MIN_EXERCISES: usize = 4;
+        const MAX_EXERCISES: usize = 6;
 
         let mut accepted = Vec::new();
         let mut rejected: Vec<RejectedExerciseWire> = Vec::new();
 
-        while accepted.len() < DIFFICULTY_PLAN.len() {
+        for action in 0..MAX_AGENT_ACTIONS {
+            self.check_cancelled()?;
+            report_progress(progress, "技能 curriculum 正在选择下一步练习动作...");
+            let accepted_json = serde_json::to_string_pretty(&accepted)?;
+            let rejected_json = serde_json::to_string_pretty(&rejected)?;
+            let decision_raw = self.chat_completion(
+                "agent.curriculum",
+                settings,
+                vec![
+                    ChatMessageWire::system(crate::skills::load("curriculum")),
+                    ChatMessageWire::user(format!(
+                        "Concept: {concept_json}\nExplanation: {explanation_context}\nPrevious exercises: {}\nAccepted: {accepted_json}\nRejected: {rejected_json}\nAction {}/{}. Return only JSON {{\"action\":\"draft_exercise|finish\",\"difficulty\":\"easy|medium|hard\",\"reason\":\"short reason\"}}. Finish requires at least {MIN_EXERCISES} accepted exercises. Maximum {MAX_EXERCISES}.",
+                        previous_exercises_json.unwrap_or("[]"), action + 1, MAX_AGENT_ACTIONS
+                    )),
+                ],
+                true,
+            ).await?;
+            let decision: AgentDecisionWire = self
+                .parse_ai_json_or_repair("agent.curriculum", settings, &decision_raw)
+                .await?;
+            if !matches!(decision.action.as_str(), "finish" | "draft_exercise") {
+                return Err(AiError::QualityGateFailed(
+                    "curriculum 技能返回无效动作".to_string(),
+                ));
+            }
+            if decision.action == "finish"
+                && accepted.len() >= MIN_EXERCISES
+                && has_difficulty_coverage(&accepted)
+            {
+                report_progress(
+                    progress,
+                    format!("技能 curriculum 已完成 {} 道练习。", accepted.len()),
+                );
+                break;
+            }
+            if accepted.len() >= MAX_EXERCISES {
+                break;
+            }
             let slot = accepted.len() + 1;
-            let target_difficulty = DIFFICULTY_PLAN[slot - 1];
+            let target_difficulty = match decision.difficulty.as_str() {
+                "easy" => "easy",
+                "medium" => "medium",
+                "hard" => "hard",
+                _ => {
+                    return Err(AiError::QualityGateFailed(
+                        "curriculum 技能返回无效难度".to_string(),
+                    ))
+                }
+            };
             let mut accepted_this_slot = false;
             report_progress(
                 progress,
                 format!(
-                    "正在生成第 {slot}/{} 道练习（难度：{target_difficulty}）...",
-                    DIFFICULTY_PLAN.len()
+                    "技能 curriculum 选择第 {slot} 道练习（难度：{target_difficulty}）：{}",
+                    decision.reason
                 ),
             );
 
             for attempt in 1..=MAX_ATTEMPTS_PER_SLOT {
+                self.check_cancelled()?;
                 let accepted_json = serde_json::to_string_pretty(&accepted)?;
                 let rejected_json = serde_json::to_string_pretty(&rejected)?;
                 report_progress(
                     progress,
                     format!(
-                        "正在生成第 {slot}/{} 道练习，第 {attempt}/{MAX_ATTEMPTS_PER_SLOT} 次尝试...",
-                        DIFFICULTY_PLAN.len()
+                        "正在生成第 {slot} 道练习，第 {attempt}/{MAX_ATTEMPTS_PER_SLOT} 次尝试..."
                     ),
                 );
                 let raw = self
@@ -333,10 +419,7 @@ impl AiClient {
                     .await?;
                 report_progress(
                     progress,
-                    format!(
-                        "第 {slot}/{} 道练习已生成，正在解析题目 JSON...",
-                        DIFFICULTY_PLAN.len()
-                    ),
+                    format!("第 {slot} 道练习已生成，正在解析题目 JSON..."),
                 );
                 let exercise: ExerciseWire = self
                     .parse_ai_json_or_repair("exercise.generate_one", settings, &raw)
@@ -344,10 +427,7 @@ impl AiClient {
                 let exercise_json = serde_json::to_string_pretty(&exercise)?;
                 report_progress(
                     progress,
-                    format!(
-                        "正在审查第 {slot}/{} 道练习是否符合讲解上下文...",
-                        DIFFICULTY_PLAN.len()
-                    ),
+                    format!("正在审查第 {slot} 道练习是否符合讲解上下文..."),
                 );
                 let validation_raw = self
                     .chat_completion_with_search(
@@ -373,10 +453,7 @@ impl AiClient {
                 if validation.is_accepted() {
                     report_progress(
                         progress,
-                        format!(
-                            "第 {slot}/{} 道练习通过上下文审查，正在做展示前可评分性审查...",
-                            DIFFICULTY_PLAN.len()
-                        ),
+                        format!("第 {slot} 道练习通过上下文审查，正在做展示前可评分性审查..."),
                     );
                     let gate_raw = self
                         .chat_completion_with_search(
@@ -399,10 +476,7 @@ impl AiClient {
                     if !gate_validation.is_accepted() {
                         report_progress(
                             progress,
-                            format!(
-                                "第 {slot}/{} 道练习展示前审查未通过，正在重试生成...",
-                                DIFFICULTY_PLAN.len()
-                            ),
+                            format!("第 {slot} 道练习展示前审查未通过，正在重试生成..."),
                         );
                         rejected.push(RejectedExerciseWire {
                             exercise,
@@ -411,21 +485,32 @@ impl AiClient {
                         continue;
                     }
 
+                    let mut exercise = exercise;
+                    let evidence = self
+                        .verify_exercise_in_sandbox(settings, &exercise, progress)
+                        .await?;
+                    if evidence.status == "contradicted" {
+                        rejected.push(RejectedExerciseWire {
+                            exercise,
+                            validation: ExerciseValidationWire {
+                                verdict: "rejected".to_string(),
+                                checked_claims: vec!["沙箱实际输出与题目预期对照".to_string()],
+                                blocking_issues: vec![evidence.note],
+                                risk_notes: Vec::new(),
+                            },
+                        });
+                        continue;
+                    }
+                    exercise.verification = Some(evidence);
                     accepted.push(exercise);
                     accepted_this_slot = true;
-                    report_progress(
-                        progress,
-                        format!("第 {slot}/{} 道练习已通过全部审查。", DIFFICULTY_PLAN.len()),
-                    );
+                    report_progress(progress, format!("第 {slot} 道练习已通过全部审查。"));
                     break;
                 }
 
                 report_progress(
                     progress,
-                    format!(
-                        "第 {slot}/{} 道练习上下文审查未通过，正在重试生成...",
-                        DIFFICULTY_PLAN.len()
-                    ),
+                    format!("第 {slot} 道练习上下文审查未通过，正在重试生成..."),
                 );
                 rejected.push(RejectedExerciseWire {
                     exercise,
@@ -434,15 +519,144 @@ impl AiClient {
             }
 
             if !accepted_this_slot {
-                return Err(AiError::QualityGateFailed(format!(
-                    "第 {slot} 道练习连续 {MAX_ATTEMPTS_PER_SLOT} 次未通过独立题目前提审查，已停止展示可疑题目"
-                )));
+                report_progress(
+                    progress,
+                    format!("第 {slot} 道练习未通过审查，技能将读取原因并重新决策。"),
+                );
             }
+        }
+
+        if accepted.len() < MIN_EXERCISES || !has_difficulty_coverage(&accepted) {
+            return Err(AiError::QualityGateFailed(format!(
+                "技能预算耗尽，{} 道练习通过审查，未满足至少 {MIN_EXERCISES} 道且覆盖 easy、medium、hard 的要求",
+                accepted.len()
+            )));
         }
 
         Ok(ExerciseSetWire {
             exercises: accepted,
         })
+    }
+
+    async fn verify_exercise_in_sandbox(
+        &self,
+        settings: &ApiSettings,
+        exercise: &ExerciseWire,
+        progress: Option<&ProgressReporter>,
+    ) -> Result<VerificationEvidence, AiError> {
+        if settings.sandbox_base_url.trim().is_empty() {
+            return Ok(VerificationEvidence {
+                status: "unverified".to_string(),
+                note: "尚未配置远端沙箱，题目已通过文本审查，待实验验证。".to_string(),
+                ..Default::default()
+            });
+        }
+        report_progress(
+            progress,
+            "技能 experiment-verification 正在设计可复现实验...",
+        );
+        let exercise_json = serde_json::to_string_pretty(exercise)?;
+        let raw = self.chat_completion(
+            "agent.experiment_probe",
+            settings,
+            vec![
+                ChatMessageWire::system(crate::skills::load("experiment-verification")),
+                ChatMessageWire::user(format!(
+                    "Exercise: {exercise_json}\nReturn only JSON: {{\"runnable\":boolean,\"code\":\"complete source code\",\"language\":\"py|js|ts|go|java|c|cpp|php|rs|r|f90|d|sh\",\"expected_stdout\":\"exact expected stdout, trim surrounding whitespace for comparison\",\"reason\":\"short reason\"}}. If expected output cannot be stated, runnable must be false."
+                )),
+            ],
+            true,
+        ).await?;
+        let probe: SandboxProbeWire = self
+            .parse_ai_json_or_repair("agent.experiment_probe", settings, &raw)
+            .await?;
+        if !probe.runnable {
+            return Ok(VerificationEvidence {
+                status: "not_applicable".to_string(),
+                note: probe.reason,
+                ..Default::default()
+            });
+        }
+        report_progress(progress, format!("沙箱正在执行 {} 实验...", probe.language));
+        let execution = crate::sandbox::execute(
+            settings,
+            uuid::Uuid::new_v4(),
+            probe.code.clone(),
+            probe.language,
+            None,
+        );
+        let result = if let Some(cancel) = self.cancel.clone() {
+            tokio::select! {
+                result = execution => result,
+                _ = wait_for_cancel(cancel) => return Err(AiError::Cancelled),
+            }
+        } else {
+            execution.await
+        };
+        match result {
+            Ok(run) => {
+                if matches!(
+                    run.status.as_str(),
+                    "authentication"
+                        | "authorization"
+                        | "rate_limited"
+                        | "resource_exhausted"
+                        | "timeout"
+                        | "internal_server"
+                        | "service_unavailable"
+                        | "external_service"
+                ) {
+                    return Ok(VerificationEvidence {
+                        status: "unavailable".to_string(),
+                        note: format!("沙箱未能完成实验：{}。{}", run.status, run.stderr),
+                        code: probe.code,
+                        stdout: run.stdout,
+                        stderr: run.stderr,
+                    });
+                }
+                let consistent =
+                    run.status == "completed" && run.stdout.trim() == probe.expected_stdout.trim();
+                let assessment_raw = self.chat_completion(
+                    "agent.experiment_assess",
+                    settings,
+                    vec![
+                        ChatMessageWire::system(crate::skills::load("experiment-verification")),
+                        ChatMessageWire::user(format!(
+                            "Exercise: {exercise_json}\nProbe code: {}\nExpected stdout: {:?}\nActual status: {}\nActual stdout: {:?}\nActual stderr: {:?}\nDoes this probe truly validate the exercise's central premise? Return only JSON {{\"verdict\":\"supported|contradicted|inconclusive\",\"reason\":\"specific reason\"}}.",
+                            probe.code, probe.expected_stdout, run.status, run.stdout, run.stderr
+                        )),
+                    ],
+                    true,
+                ).await?;
+                let assessment: ObservationAssessmentWire = self
+                    .parse_ai_json_or_repair("agent.experiment_assess", settings, &assessment_raw)
+                    .await?;
+                let status = if !consistent || assessment.verdict == "contradicted" {
+                    "contradicted"
+                } else if assessment.verdict == "supported" {
+                    "verified"
+                } else {
+                    "inconclusive"
+                };
+                let note = format!(
+                    "实际状态 {}，实际输出 {:?}，预期输出 {:?}。{}",
+                    run.status, run.stdout, probe.expected_stdout, assessment.reason
+                );
+                Ok(VerificationEvidence {
+                    status: status.to_string(),
+                    note,
+                    code: probe.code,
+                    stdout: run.stdout,
+                    stderr: run.stderr,
+                })
+            }
+            Err(error) => Ok(VerificationEvidence {
+                status: "unavailable".to_string(),
+                note: format!("沙箱实验暂不可用：{error}"),
+                code: probe.code,
+                ..Default::default()
+            }),
+        }
     }
 
     async fn parse_ai_json_or_repair<T>(
@@ -803,6 +1017,7 @@ Malformed assistant output is encoded as this JSON string:
         let deepseek_thinking = is_deepseek_base_url(&settings.base_url);
 
         for round in 0..=MAX_TOOL_ROUNDS {
+            self.check_cancelled()?;
             let payload = chat_completion_payload(
                 &model,
                 &messages,
@@ -819,11 +1034,7 @@ Malformed assistant output is encoded as this JSON string:
             log_ai_request(&round_label, &payload);
 
             let response = self
-                .http
-                .post(&url)
-                .bearer_auth(&api_key)
-                .json(&payload)
-                .send()
+                .send_with_cancel(self.http.post(&url).bearer_auth(&api_key).json(&payload))
                 .await?;
             let response = ensure_success(response).await?;
             let body: ChatCompletionResponse = response.json().await?;
@@ -924,11 +1135,7 @@ Malformed assistant output is encoded as this JSON string:
         log_ai_request(&final_label, &payload);
 
         let response = self
-            .http
-            .post(url)
-            .bearer_auth(api_key)
-            .json(&payload)
-            .send()
+            .send_with_cancel(self.http.post(url).bearer_auth(api_key).json(&payload))
             .await?;
         let response = ensure_success(response).await?;
         let body: ChatCompletionResponse = response.json().await?;
@@ -992,6 +1199,7 @@ Malformed assistant output is encoded as this JSON string:
 
         messages.push(ChatMessageWire::assistant(combined.clone()));
         for index in 1..=MAX_CONTINUATIONS {
+            self.check_cancelled()?;
             messages.push(ChatMessageWire::user(
                 "The previous response was cut off by the output token limit. Continue exactly from the next character. Do not repeat previous text. Do not summarize or shorten. Do not add commentary. If this is JSON, continue the same JSON text until it is complete.",
             ));
@@ -1000,11 +1208,7 @@ Malformed assistant output is encoded as this JSON string:
             log_ai_request(&continuation_label, &payload);
 
             let response = self
-                .http
-                .post(url)
-                .bearer_auth(api_key)
-                .json(&payload)
-                .send()
+                .send_with_cancel(self.http.post(url).bearer_auth(api_key).json(&payload))
                 .await?;
             let response = ensure_success(response).await?;
             let body: ChatCompletionResponse = response.json().await?;
@@ -1100,6 +1304,12 @@ Malformed assistant output is encoded as this JSON string:
             })
             .to_string()),
         }
+    }
+}
+
+async fn wait_for_cancel(cancel: Arc<AtomicBool>) {
+    while !cancel.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -1233,6 +1443,25 @@ fn json_repair_schema(label: &str) -> &'static str {
   "mistakes": string[],
   "corrected_answer": string,
   "next_steps": string[]
+}"#
+    } else if label.starts_with("agent.curriculum") {
+        r#"{
+  "action": "draft_exercise | finish",
+  "difficulty": "easy | medium | hard",
+  "reason": string
+}"#
+    } else if label.starts_with("agent.experiment_probe") {
+        r#"{
+  "runnable": boolean,
+  "code": string,
+  "language": string,
+  "expected_stdout": string,
+  "reason": string
+}"#
+    } else if label.starts_with("agent.experiment_assess") {
+        r#"{
+  "verdict": "supported | contradicted | inconclusive",
+  "reason": string
 }"#
     } else if label.starts_with("experiment_prompt") {
         r#"{
@@ -1762,11 +1991,43 @@ struct ExerciseWire {
     expected_answer: String,
     hints: Vec<String>,
     difficulty: String,
+    #[serde(skip)]
+    verification: Option<VerificationEvidence>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ExerciseSetWire {
     exercises: Vec<ExerciseWire>,
+}
+
+fn has_difficulty_coverage(exercises: &[ExerciseWire]) -> bool {
+    ["easy", "medium", "hard"].iter().all(|difficulty| {
+        exercises
+            .iter()
+            .any(|exercise| exercise.difficulty == *difficulty)
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentDecisionWire {
+    action: String,
+    difficulty: String,
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SandboxProbeWire {
+    runnable: bool,
+    code: String,
+    language: String,
+    expected_stdout: String,
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ObservationAssessmentWire {
+    verdict: String,
+    reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1798,7 +2059,7 @@ struct RejectedExerciseWire {
 
 impl ExerciseWire {
     fn into_exercise(self, concept_id: Option<uuid::Uuid>) -> Exercise {
-        Exercise::new(
+        let mut exercise = Exercise::new(
             concept_id,
             self.kind,
             self.title,
@@ -1807,7 +2068,9 @@ impl ExerciseWire {
             self.expected_answer,
             self.hints,
             self.difficulty,
-        )
+        );
+        exercise.verification = self.verification;
+        exercise
     }
 }
 
@@ -2105,20 +2368,20 @@ mod tests {
             "webPages": {
                 "value": [
                     {
-                        "name": "Dioxus signals",
-                        "url": "https://dioxuslabs.com/docs",
-                        "summary": "Signals are owned by a scope."
+                        "name": "Rust async",
+                        "url": "https://doc.rust-lang.org/book/",
+                        "summary": "Futures are polled by an executor."
                     }
                 ]
             }
         });
 
-        let results = parse_bocha_results("dioxus signal scope", &body);
+        let results = parse_bocha_results("rust async", &body);
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].provider, "Bocha");
-        assert_eq!(results[0].title, "Dioxus signals");
-        assert_eq!(results[0].snippet, "Signals are owned by a scope.");
+        assert_eq!(results[0].title, "Rust async");
+        assert_eq!(results[0].snippet, "Futures are polled by an executor.");
     }
 
     #[test]
@@ -2258,5 +2521,192 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(names, vec!["Tavily", "Bocha"]);
+    }
+
+    #[test]
+    fn curriculum_agent_drives_generation_with_mock_model() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let mut request_count = 0;
+            let mut curriculum_count = 0;
+            while std::time::Instant::now() < deadline && request_count < 18 {
+                let (mut socket, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("mock accept failed: {error}"),
+                };
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut received = Vec::new();
+                let mut buffer = [0_u8; 8192];
+                loop {
+                    let count = socket.read(&mut buffer).unwrap();
+                    received.extend_from_slice(&buffer[..count]);
+                    let Some(header_end) = received.windows(4).position(|part| part == b"\r\n\r\n")
+                    else {
+                        continue;
+                    };
+                    let header =
+                        String::from_utf8_lossy(&received[..header_end]).to_ascii_lowercase();
+                    let length = header
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length: "))
+                        .unwrap()
+                        .parse::<usize>()
+                        .unwrap();
+                    if received.len() >= header_end + 4 + length {
+                        break;
+                    }
+                }
+                let header_end = received
+                    .windows(4)
+                    .position(|part| part == b"\r\n\r\n")
+                    .unwrap();
+                let payload: Value = serde_json::from_slice(&received[header_end + 4..]).unwrap();
+                let system = payload["messages"][0]["content"].as_str().unwrap_or("");
+                let user = payload["messages"][1]["content"].as_str().unwrap_or("");
+                let content = if system.contains("name: curriculum") {
+                    curriculum_count += 1;
+                    if curriculum_count == 5 {
+                        json!({"action":"finish","difficulty":"hard","reason":"coverage complete"})
+                    } else {
+                        let difficulty = ["easy", "medium", "hard", "hard"][curriculum_count - 1];
+                        json!({"action":"draft_exercise","difficulty":difficulty,"reason":"next gap"})
+                    }
+                } else if user.contains("Concept Explainer agent") {
+                    json!({"topic_title":"Python 变量","explanation":"Python 变量与打印。","concept":{"title":"变量","language":"Python","summary":"变量保存值。","key_points":["赋值", "打印"]}})
+                } else if user.contains("Exercise Writer agent") {
+                    let slot = (1..=4)
+                        .find(|slot| user.contains(&format!("slot {slot}.")))
+                        .unwrap();
+                    let difficulty = ["easy", "medium", "hard", "hard"][slot - 1];
+                    json!({"kind":"FillBlank","title":format!("题目 {slot}"),"prompt":"打印变量","starter_code":"x = 1\nprint(x)","expected_answer":"1","hints":[],"difficulty":difficulty})
+                } else {
+                    json!({"verdict":"accepted","checked_claims":[],"blocking_issues":[],"risk_notes":[]})
+                };
+                let body = json!({"choices":[{"message":{"content":content.to_string()},"finish_reason":"stop"}]}).to_string();
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+                request_count += 1;
+            }
+            (request_count, curriculum_count)
+        });
+        let mut settings = ApiSettings::default();
+        settings.base_url = format!("http://{address}/v1");
+        settings.api_key = "test-key".to_string();
+        settings.selected_model = "mock-model".to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let result = runtime
+            .block_on(AiClient::default().explain_and_generate(&settings, "Python 变量", None))
+            .unwrap();
+        let (requests, decisions) = server.join().unwrap();
+        assert_eq!(requests, 18);
+        assert_eq!(decisions, 5);
+        assert_eq!(result.exercises.len(), 4);
+        assert!(result.exercises.iter().all(|exercise| exercise
+            .verification
+            .as_ref()
+            .is_some_and(|v| v.status == "unverified")));
+    }
+
+    #[test]
+    fn cancelling_an_inflight_model_request_returns_promptly() {
+        use std::io::Read;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut bytes = [0_u8; 1024];
+            let _ = socket.read(&mut bytes);
+            std::thread::sleep(Duration::from_millis(600));
+        });
+        let mut settings = ApiSettings::default();
+        settings.base_url = format!("http://{address}/v1");
+        settings.api_key = "test-key".to_string();
+        settings.selected_model = "mock-model".to_string();
+        let flag = Arc::new(AtomicBool::new(false));
+        let trigger = flag.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            trigger.store(true, Ordering::Relaxed);
+        });
+        let started = std::time::Instant::now();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let result = runtime.block_on(AiClient::default().with_cancel(flag).chat_completion(
+            "cancel-test",
+            &settings,
+            vec![ChatMessageWire::user("hello")],
+            false,
+        ));
+        canceller.join().unwrap();
+        server.join().unwrap();
+        assert!(matches!(result, Err(AiError::Cancelled)));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn sandbox_observation_blocks_a_conflicting_exercise() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let model_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let model_address = model_listener.local_addr().unwrap();
+        let model_server = std::thread::spawn(move || {
+            for index in 0..2 {
+                let (mut socket, _) = model_listener.accept().unwrap();
+                let mut bytes = [0_u8; 8192];
+                let _ = socket.read(&mut bytes).unwrap();
+                let content = if index == 0 {
+                    json!({"runnable":true,"code":"print(43)","language":"py","expected_stdout":"42","reason":"check printed value"})
+                } else {
+                    json!({"verdict":"supported","reason":"the probe prints the value"})
+                };
+                let body = json!({"choices":[{"message":{"content":content.to_string()},"finish_reason":"stop"}]}).to_string();
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            }
+        });
+        let sandbox_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let sandbox_address = sandbox_listener.local_addr().unwrap();
+        let sandbox_server = std::thread::spawn(move || {
+            let (mut socket, _) = sandbox_listener.accept().unwrap();
+            let mut bytes = [0_u8; 4096];
+            let _ = socket.read(&mut bytes).unwrap();
+            let body = "{\"session_id\":\"s1\",\"stdout\":\"43\\n\",\"stderr\":\"\",\"files\":[]}";
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
+        let mut settings = ApiSettings::default();
+        settings.base_url = format!("http://{model_address}/v1");
+        settings.api_key = "test-key".to_string();
+        settings.selected_model = "mock-model".to_string();
+        settings.sandbox_base_url = format!("http://{sandbox_address}");
+        let exercise = ExerciseWire {
+            kind: ExerciseKind::PredictCompileResult,
+            title: "输出".to_string(),
+            prompt: "预测输出".to_string(),
+            starter_code: "print(43)".to_string(),
+            expected_answer: "42".to_string(),
+            hints: Vec::new(),
+            difficulty: "easy".to_string(),
+            verification: None,
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let evidence = runtime
+            .block_on(AiClient::default().verify_exercise_in_sandbox(&settings, &exercise, None))
+            .unwrap();
+        model_server.join().unwrap();
+        sandbox_server.join().unwrap();
+        assert_eq!(evidence.status, "contradicted");
+        assert_eq!(evidence.stdout, "43\n");
     }
 }

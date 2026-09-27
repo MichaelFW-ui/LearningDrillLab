@@ -2,98 +2,42 @@
 
 [中文](README.zh-CN.md)
 
-Learning Drill Lab is a desktop app for practicing programming concepts with an AI tutor. Give it a topic, and it builds a study session with an explanation, exercises, answer review, and follow-up chat.
+Learning Drill Lab is a Tauri 2 desktop app for learning programming concepts. It generates explanations and exercises, reviews answers, supports follow-up chat, and preserves local topic history.
 
-The current prompts are written for Chinese tutoring. The app itself is a Rust/Dioxus desktop app.
+## Run and build
 
-## Features
-
-- Topic-based explanations with code examples and common mistakes.
-- Exercise generation with a validation pass before questions are shown.
-- Answer review that can accept a correct challenge to a flawed question.
-- Follow-up chat tied to the current topic, exercises, and attempts.
-- Local topic history.
-- Optional web grounding through Bocha or Tavily.
-- Optional page reading through Jina Reader.
-
-## Quick Start
+Install Node.js, Rust, and the platform dependencies for Tauri 2, then run:
 
 ```bash
-cargo run
+npm ci
+npm run tauri dev
 ```
 
-Open **Settings** in the app and configure:
-
-- `Base URL`: a Chat Completions compatible endpoint, for example `https://api.openai.com/v1`
-- `API Key`
-- a model from the fetched model list
-
-The app can run without search keys. Search and page reading are optional.
-
-## Optional Search Setup
-
-Learning Drill Lab exposes two tools to the model when the relevant settings are present.
-
-### `web_search`
-
-Enabled by either:
-
-- Bocha API key
-- Tavily API key
-
-Tavily is tried first when configured. If Tavily fails, Bocha is used as fallback. Each search tool call sends one query and returns up to 10 results.
-
-For a Tavily-compatible proxy, set `Tavily HTTP Base URL` to the proxy's Tavily-style HTTP API base. Do not put an MCP endpoint in this field. A value ending in `/search` is also accepted.
-
-### `web_fetch`
-
-Enabled by default as a public Jina Reader fetch tool.
-
-- The model chooses which URLs to read.
-- At most 5 URLs are fetched per call.
-- Fetches are serial, with a 3 second delay between URLs.
-- Public Jina Reader is used first without an API key.
-- A configured Jina API key is used only after public Reader returns an auth or rate-limit response.
-- Jina is not used for search.
-
-## Local Data
-
-The app stores state on your machine using the OS config directory. The settings page shows the exact `state.json` path.
-
-Stored in `state.json`:
-
-- API keys
-- selected model and endpoints
-- topic history
-- exercises
-- answers and reviews
-
-The file is plain JSON. Treat it as sensitive.
-
-## Debug Logging
-
-AI debug logging is disabled by default.
-
-To enable it:
+Build the macOS application:
 
 ```bash
-LEARNING_DRILL_LAB_AI_DEBUG=1 cargo run
+npm run tauri build -- --bundles app
 ```
 
-When enabled, the app writes full AI requests, responses, tool results, fetched page text, and JSON repair attempts to a local `ai-debug.log` file. Do not share that log unless you have reviewed it.
-
-## Development
+Run Rust checks with the Tauri manifest:
 
 ```bash
-cargo fmt
-cargo check
-cargo test
+cargo fmt --manifest-path src-tauri/Cargo.toml --all
+cargo test --manifest-path src-tauri/Cargo.toml --locked
 ```
 
-## Notes
+## Configuration
 
-- This is an early desktop app, not a packaged release.
-- API keys are currently stored in plain text.
-- The UI and prompts are still tuned around the author's workflow.
-- The app expects a Chat Completions style API with tool call support for search/fetch.
+In Settings, enter a Chat Completions compatible Base URL and API Key, fetch models, and select one. Bocha, Tavily, and Jina enable optional search and page reading. Topics, exercises, reviews, experiments, and credentials are stored in the local `state.json` shown in Settings. The credentials are currently plaintext. Saves retain a `state.json.bak` backup, which the app can read if the primary file is invalid.
 
+The `curriculum` skill chooses exercise actions and difficulties. Exercises pass context and grading checks. When LibreCodeInterpreter is configured, the `experiment-verification` skill also creates sandbox probes and compares observed output. The exercise panel shows verification status and supports manual sandbox runs with stdout, stderr, and timing.
+
+Set the sandbox base URL and API key in Settings. The client calls `/exec` with LibreChat compatible `code`, `lang`, and optional `session_id` fields, using `x-api-key` authentication. An empty sandbox URL leaves exercises marked as awaiting execution verification.
+
+## Skills
+
+Built-in skills live under `src-tauri/skills/`. Override either skill by placing `skills/curriculum/SKILL.md` or `skills/experiment-verification/SKILL.md` beside the local `state.json`, using matching YAML frontmatter. The app shows the active source in Settings. Rust enforces tool access and quality gates.
+
+## Debugging
+
+AI debug logging is disabled by default. Use `LEARNING_DRILL_LAB_AI_DEBUG=1 npm run tauri dev` during development. Review the log before sharing it: it can contain complete prompts, responses, and fetched pages.

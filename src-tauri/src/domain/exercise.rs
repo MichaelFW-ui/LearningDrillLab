@@ -11,17 +11,6 @@ pub enum ExerciseKind {
     PredictCompileResult,
 }
 
-impl ExerciseKind {
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::FillBlank => "填空题",
-            Self::FixBug => "改错题",
-            Self::WriteFromScratch => "从零写代码",
-            Self::PredictCompileResult => "预测编译结果",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Exercise {
     pub id: Uuid,
@@ -33,6 +22,17 @@ pub struct Exercise {
     pub expected_answer: String,
     pub hints: Vec<String>,
     pub difficulty: String,
+    #[serde(default)]
+    pub verification: Option<VerificationEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct VerificationEvidence {
+    pub status: String,
+    pub note: String,
+    pub code: String,
+    pub stdout: String,
+    pub stderr: String,
 }
 
 impl Exercise {
@@ -56,6 +56,7 @@ impl Exercise {
             expected_answer: expected_answer.into(),
             hints,
             difficulty: difficulty.into(),
+            verification: None,
         }
     }
 }
