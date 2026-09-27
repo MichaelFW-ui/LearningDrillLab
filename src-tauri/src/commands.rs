@@ -108,6 +108,9 @@ pub fn save_settings(
         .trim()
         .trim_end_matches('/')
         .to_string();
+    if !settings.sandbox_base_url.is_empty() {
+        crate::sandbox::validate_base_url(&settings.sandbox_base_url)?;
+    }
     settings.sandbox_api_key = settings.sandbox_api_key.trim().to_string();
     with_state(&state, |app| {
         app.settings = settings;

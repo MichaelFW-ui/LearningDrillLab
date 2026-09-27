@@ -671,7 +671,7 @@ impl AiClient {
             vec![
                 ChatMessageWire::system(crate::skills::load("experiment-verification")),
                 ChatMessageWire::user(format!(
-                    "Exercise: {exercise_json}\nReturn only JSON: {{\"runnable\":boolean,\"code\":\"complete source code\",\"language\":\"py|js|ts|go|java|c|cpp|php|rs|r|f90|d|sh\",\"expected_stdout\":\"exact expected stdout, trim surrounding whitespace for comparison\",\"reason\":\"short reason\"}}. If expected output cannot be stated, runnable must be false."
+                    "Exercise: {exercise_json}\nReturn only JSON: {{\"runnable\":boolean,\"code\":\"complete source code\",\"language\":\"py|js|ts|go|java|c|cpp|php|rs|r|f90|d\",\"expected_stdout\":\"exact expected stdout, trim surrounding whitespace for comparison\",\"reason\":\"short reason\"}}. If expected output cannot be stated, runnable must be false."
                 )),
             ],
             true,
