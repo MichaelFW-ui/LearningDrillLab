@@ -2,98 +2,42 @@
 
 [English](README.md)
 
-Learning Drill Lab 是一个桌面学习工具，用 AI 辅助练习编程概念。输入一个主题，它会生成讲解、练习题、答案评审和追问对话。
+Learning Drill Lab 是基于 Tauri 2 的桌面学习工具。输入编程主题后，应用生成讲解和练习，评审答案，并保留追问与本地话题历史。
 
-目前提示词主要面向中文教学。应用本身使用 Rust 和 Dioxus 编写。
+## 启动与构建
 
-## 功能
-
-- 按主题生成讲解，包含代码例子和常见错误。
-- 生成练习题，并在展示前做一次题目校验。
-- 评审答案；如果题目本身有问题，正确指出问题也可以算作正确回答。
-- 追问对话会带上当前主题、题目和作答记录。
-- 本地保存话题历史。
-- 可选接入 Bocha 或 Tavily 做联网搜索。
-- 可选使用 Jina Reader 读取网页正文。
-
-## 快速开始
+需要 Node.js、Rust 和 Tauri 2 对应平台依赖。首次安装依赖后运行：
 
 ```bash
-cargo run
+npm ci
+npm run tauri dev
 ```
 
-打开应用里的 **设置**，填写：
-
-- `Base URL`：Chat Completions 兼容接口，例如 `https://api.openai.com/v1`
-- `API Key`
-- 拉取模型列表后选择模型
-
-可以不填搜索 key。未配置搜索服务时，应用仍然可以作为普通 AI 学习助手使用。
-
-## 可选搜索配置
-
-配置对应服务后，应用会把下面两个工具暴露给模型。
-
-### `web_search`
-
-满足任意一个条件即可启用：
-
-- 填写 Bocha API Key
-- 填写 Tavily API Key
-
-如果同时配置 Tavily 和 Bocha，会先用 Tavily。Tavily 失败时自动 fallback 到 Bocha。每次搜索工具调用只发送一个 query，最多返回 10 条结果。
-
-如果使用 Tavily 兼容的中转，请在 `Tavily HTTP Base URL` 填 Tavily 风格 HTTP API 的基础地址。不要填 MCP 地址。直接填到 `/search` 也可以。
-
-### `web_fetch`
-
-默认使用 Jina Reader public endpoint 读取网页正文。
-
-- 由模型选择要读取的 URL。
-- 每次最多读取 5 个 URL。
-- 多个 URL 串行读取。
-- 每个 URL 之间间隔 3 秒。
-- 默认不带 Jina API Key。
-- 只有 public Reader 返回鉴权或限流响应时，才使用配置的 Jina API Key 重试。
-- Jina 不用于搜索。
-
-## 本地数据
-
-应用使用系统配置目录保存状态。设置页会显示 `state.json` 的完整路径。
-
-`state.json` 中会保存：
-
-- API keys
-- 当前模型和接口地址
-- 话题历史
-- 练习题
-- 回答和评审记录
-
-这个文件是明文 JSON，请把它当作敏感文件处理。
-
-## 调试日志
-
-AI 调试日志默认关闭。
-
-开启方式：
+打包 macOS 应用：
 
 ```bash
-LEARNING_DRILL_LAB_AI_DEBUG=1 cargo run
+npm run tauri build -- --bundles app
 ```
 
-开启后，应用会把完整 AI 请求、响应、工具结果、读取到的网页正文和 JSON 修复过程写入本地 `ai-debug.log`。分享日志前请先检查内容。
-
-## 开发
+Rust 检查和测试使用 `src-tauri/Cargo.toml`：
 
 ```bash
-cargo fmt
-cargo check
-cargo test
+cargo fmt --manifest-path src-tauri/Cargo.toml --all
+cargo test --manifest-path src-tauri/Cargo.toml --locked
 ```
 
-## 说明
+## 使用
 
-- 目前还是早期桌面应用，没有做正式打包发布。
-- API Key 现在是明文保存。
-- UI 和提示词仍然偏个人工作流。
-- 搜索和读取工具依赖 Chat Completions 风格的 tool call 支持。
+在设置页填写模型接口基础地址（`Base URL`）、模型接口密钥（`API Key`），拉取并选择模型。Bocha、Tavily 和 Jina 配置提供可选的联网搜索与网页读取。话题、练习、答案、评审和实验记录保存在设置页显示的本地 `state.json` 中；密钥目前以明文保存，请保护该文件。保存时会生成 `state.json.bak`，主文件损坏时应用会尝试从备份读取。
+
+练习生成由内置的 `curriculum` 技能选择下一步动作和难度。题目经过上下文及可评分性审查。配置远端 LibreCodeInterpreter 后，`experiment-verification` 技能还会设计可执行探针，核对沙箱实际输出；验证状态显示在题目上。练习页的“沙箱实验”允许手动运行完整代码并查看标准输出、标准错误和耗时。
+
+沙箱设置填写服务基础地址与密钥。客户端按 LibreChat 兼容格式向 `/exec` 发送 `code`、`lang`、可选 `session_id`，使用 `x-api-key` 鉴权。支持的语言别名包括 Python、JavaScript、TypeScript、Go、Java、C、C++、PHP、Rust、R、Fortran、D 和 Bash。服务地址留空时，练习保留文本审查结果，验证状态显示为待实验。
+
+## 技能
+
+两个内置技能位于 `src-tauri/skills/`。如需调整教学策略，可在 `state.json` 所在目录下建立 `skills/curriculum/SKILL.md` 或 `skills/experiment-verification/SKILL.md`，使用同名的 YAML frontmatter。应用会优先读取本地技能文件；工具权限、题目数量下限和审查门槛仍由 Rust 代码控制。设置页会显示技能来源。
+
+## 调试
+
+AI 调试日志默认关闭。开发时可用 `LEARNING_DRILL_LAB_AI_DEBUG=1 npm run tauri dev` 开启；日志可能包含完整提示词、响应和网页内容，分享前请检查。
