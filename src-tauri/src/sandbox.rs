@@ -52,9 +52,22 @@ fn normalized_language(language: &str) -> Option<&'static str> {
         "r" => Some("r"),
         "fortran" | "f90" => Some("f90"),
         "d" => Some("d"),
-        "bash" | "sh" => Some("sh"),
         _ => None,
     }
+}
+
+pub fn validate_base_url(base: &str) -> Result<(), String> {
+    let url = Url::parse(base).map_err(|_| "沙箱地址格式无效".to_string())?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err("沙箱地址必须使用 HTTP 或 HTTPS".to_string());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("沙箱地址请只填写服务地址；API Key 请单独填写在沙箱 API Key 栏".to_string());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("沙箱地址不能包含查询参数或片段".to_string());
+    }
+    Ok(())
 }
 
 fn truncate(value: String) -> String {
@@ -83,10 +96,8 @@ pub async fn execute(
     if base.is_empty() {
         return Err("请先在设置页填写 LibreCodeInterpreter 地址".to_string());
     }
+    validate_base_url(base)?;
     let url = Url::parse(&format!("{base}/exec")).map_err(|_| "沙箱地址格式无效".to_string())?;
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err("沙箱地址必须使用 HTTP 或 HTTPS".to_string());
-    }
     let http = Client::builder()
         .timeout(Duration::from_secs(45))
         .build()
@@ -159,8 +170,16 @@ mod tests {
     fn aliases_and_limits() {
         assert_eq!(normalized_language("Rust"), Some("rs"));
         assert_eq!(normalized_language("C++"), Some("cpp"));
+        assert_eq!(normalized_language("sh"), None);
         assert_eq!(normalized_language("unknown"), None);
         assert!(truncate("a".repeat(20_001)).ends_with("[输出已截断]"));
+    }
+
+    #[test]
+    fn sandbox_url_keeps_credentials_out_of_url() {
+        assert!(validate_base_url("https://code.example:8443").is_ok());
+        assert!(validate_base_url("https://secret@code.example:8443").is_err());
+        assert!(validate_base_url("https://code.example:8443?key=secret").is_err());
     }
 
     #[test]
