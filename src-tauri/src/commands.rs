@@ -333,6 +333,7 @@ pub async fn follow_up(
 
 #[tauri::command]
 pub async fn submit_answer(
+    app_handle: AppHandle,
     state: State<'_, ManagedState>,
     answer: String,
 ) -> Result<AppState, String> {
@@ -340,6 +341,7 @@ pub async fn submit_answer(
     if answer.is_empty() {
         return Err("请输入答案后再提交".to_string());
     }
+    let cancel = start_task(&state)?;
     let (topic_id, settings, exercise) = {
         let app = state.0.lock().map_err(|e| e.to_string())?;
         let topic = app.active_topic().ok_or("当前没有可用话题")?;
@@ -353,7 +355,13 @@ pub async fn submit_answer(
         )
     };
     let mut review = AiClient::default()
-        .review_attempt(&settings, &exercise, &answer)
+        .with_cancel(cancel.flag.clone())
+        .review_attempt(
+            &settings,
+            &exercise,
+            &answer,
+            Some(progress_reporter(app_handle)),
+        )
         .await
         .map_err(|e| e.to_string())?;
     let mut attempt = Attempt::new(exercise.id, answer);

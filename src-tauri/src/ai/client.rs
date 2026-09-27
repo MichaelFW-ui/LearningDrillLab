@@ -129,38 +129,16 @@ impl AiClient {
         topic: &str,
         progress: Option<ProgressReporter>,
     ) -> Result<ExplainAndGenerateResponse, AiError> {
-        report_progress(progress.as_ref(), "正在整理学习目标并生成讲解...");
-        let raw = self
-            .chat_completion_with_search(
-                "concept.explain",
-                settings,
-                vec![
-                    ChatMessageWire::system(prompts::learning_system_prompt()),
-                    ChatMessageWire::user(prompts::explain_topic_prompt(topic)),
-                ],
-                true,
-                progress.as_ref(),
-            )
+        let output = self
+            .run_learning_agent(settings, Some(topic), None, None, None, progress.as_ref())
             .await?;
-        report_progress(progress.as_ref(), "讲解已生成，正在解析结构化内容...");
-        let parsed: TopicExplanationWire = self
-            .parse_ai_json_or_repair("concept.explain", settings, &raw)
-            .await?;
-        report_progress(progress.as_ref(), "讲解解析完成，正在准备生成练习...");
-        let concept_json = serde_json::to_string_pretty(&parsed.concept)?;
-        let exercises = self
-            .generate_validated_exercises(
-                settings,
-                &concept_json,
-                &parsed.explanation,
-                None,
-                progress.as_ref(),
-            )
-            .await?;
+        let parsed = output
+            .topic
+            .ok_or_else(|| AiError::QualityGateFailed("学习技能未生成讲解".to_string()))?;
         report_progress(progress.as_ref(), "练习全部通过审查，正在写入学习会话...");
         let concept = parsed.concept.into_concept();
         let concept_id = concept.id;
-        let exercises = exercises
+        let exercises = output
             .exercises
             .into_iter()
             .map(|exercise| exercise.into_exercise(Some(concept_id)))
@@ -170,7 +148,7 @@ impl AiClient {
             explanation: parsed.explanation,
             concept,
             exercises,
-            raw_response: raw,
+            raw_response: output.raw_response,
         })
     }
 
@@ -179,55 +157,113 @@ impl AiClient {
         settings: &ApiSettings,
         exercise: &Exercise,
         answer: &str,
+        progress: Option<ProgressReporter>,
     ) -> Result<ReviewResult, AiError> {
+        const MAX_REVIEW_ACTIONS: usize = 8;
         let exercise_json = serde_json::to_string_pretty(exercise)?;
-        let validation_raw = self
-            .chat_completion_with_search(
-                "review.exercise_gate",
-                settings,
-                vec![
-                    ChatMessageWire::system(prompts::learning_system_prompt()),
-                    ChatMessageWire::user(prompts::review_exercise_gate_prompt(&exercise_json)),
-                ],
-                true,
-                None,
-            )
-            .await?;
-        let validation: ExerciseValidationWire = self
-            .parse_ai_json_or_repair("review.exercise_gate", settings, &validation_raw)
-            .await?;
-        if !validation.is_accepted() {
-            return Ok(ReviewResult::new(
-                None,
-                true,
-                100,
-                format!(
-                    "这道题未通过题目前提审查，因此不应按原题扣分。审查结论：{}",
-                    validation.summary()
-                ),
-                validation.blocking_issues,
-                "建议重新生成练习，或把这道题改成可观察输出/显式断言的题目。".to_string(),
-                vec!["重新生成练习后再提交答案。".to_string()],
-                Some(validation_raw),
-            ));
-        }
+        let mut audited = false;
+        let mut result: Option<ReviewResult> = None;
+        let mut observation = "开始答案评审。".to_string();
 
-        let raw = self
-            .chat_completion_with_search(
-                "review",
-                settings,
-                vec![
-                    ChatMessageWire::system(prompts::learning_system_prompt()),
-                    ChatMessageWire::user(prompts::review_prompt(&exercise_json, answer)),
-                ],
-                true,
-                None,
-            )
-            .await?;
-        let parsed: ReviewResultWire = self
-            .parse_ai_json_or_repair("review", settings, &raw)
-            .await?;
-        Ok(parsed.into_review(Some(raw)))
+        for turn in 1..=MAX_REVIEW_ACTIONS {
+            self.check_cancelled()?;
+            let decision_raw = self
+                .chat_completion(
+                    "agent.answer-review",
+                    settings,
+                    vec![
+                        ChatMessageWire::system(crate::skills::load("answer-review")),
+                        ChatMessageWire::user(format!(
+                            "Exercise: {exercise_json}\nLearner answer: {answer}\nState: {{\"audited\":{audited},\"graded\":{},\"last_observation\":{},\"turn\":{turn},\"max_turns\":{MAX_REVIEW_ACTIONS}}}\nReturn only JSON {{\"action\":\"audit_question|grade_answer|finish\",\"reason\":\"short reason\"}}.",
+                            result.is_some(),
+                            serde_json::to_string(&observation)?,
+                        )),
+                    ],
+                    true,
+                )
+                .await?;
+            let decision: AgentDecisionWire = self
+                .parse_ai_json_or_repair("agent.answer-review", settings, &decision_raw)
+                .await?;
+            report_progress(
+                progress.as_ref(),
+                format!(
+                    "技能 answer-review 选择 {}：{}",
+                    decision.action, decision.reason
+                ),
+            );
+            observation = match decision.action.as_str() {
+                "audit_question" if !audited => {
+                    let validation_raw = self
+                        .chat_completion_with_search(
+                            "review.exercise_gate",
+                            settings,
+                            vec![
+                                ChatMessageWire::system(prompts::learning_system_prompt()),
+                                ChatMessageWire::user(prompts::review_exercise_gate_prompt(
+                                    &exercise_json,
+                                )),
+                            ],
+                            true,
+                            None,
+                        )
+                        .await?;
+                    let validation: ExerciseValidationWire = self
+                        .parse_ai_json_or_repair("review.exercise_gate", settings, &validation_raw)
+                        .await?;
+                    if !validation.is_accepted() {
+                        report_progress(
+                            progress.as_ref(),
+                            format!("Agent 观察：题目审查未通过：{}", validation.summary()),
+                        );
+                        return Ok(ReviewResult::new(
+                            None,
+                            true,
+                            100,
+                            format!(
+                                "这道题未通过题目前提审查，因此不应按原题扣分。审查结论：{}",
+                                validation.summary()
+                            ),
+                            validation.blocking_issues,
+                            "建议重新生成练习，或把这道题改成可观察输出/显式断言的题目。"
+                                .to_string(),
+                            vec!["重新生成练习后再提交答案。".to_string()],
+                            Some(validation_raw),
+                        ));
+                    }
+                    audited = true;
+                    "题目前提审查通过，可以评判答案。".to_string()
+                }
+                "grade_answer" if audited && result.is_none() => {
+                    let raw = self
+                        .chat_completion_with_search(
+                            "review",
+                            settings,
+                            vec![
+                                ChatMessageWire::system(prompts::learning_system_prompt()),
+                                ChatMessageWire::user(prompts::review_prompt(
+                                    &exercise_json,
+                                    answer,
+                                )),
+                            ],
+                            true,
+                            None,
+                        )
+                        .await?;
+                    let parsed: ReviewResultWire = self
+                        .parse_ai_json_or_repair("review", settings, &raw)
+                        .await?;
+                    result = Some(parsed.into_review(Some(raw)));
+                    "答案评审完成，可以结束。".to_string()
+                }
+                "finish" if result.is_some() => return Ok(result.unwrap()),
+                _ => "当前状态不允许这个动作；必须先审查题目，再评判答案。".to_string(),
+            };
+            report_progress(progress.as_ref(), format!("Agent 观察：{observation}"));
+        }
+        Err(AiError::QualityGateFailed(format!(
+            "答案评审动作预算耗尽；最后观察：{observation}"
+        )))
     }
 
     pub async fn regenerate_exercises(
@@ -320,142 +356,205 @@ impl AiClient {
         previous_exercises_json: Option<&str>,
         progress: Option<&ProgressReporter>,
     ) -> Result<ExerciseSetWire, AiError> {
-        const MAX_ATTEMPTS_PER_SLOT: usize = 3;
-        const MAX_AGENT_ACTIONS: usize = 8;
+        let output = self
+            .run_learning_agent(
+                settings,
+                None,
+                Some(concept_json),
+                Some(explanation_context),
+                previous_exercises_json,
+                progress,
+            )
+            .await?;
+        Ok(ExerciseSetWire {
+            exercises: output.exercises,
+        })
+    }
+
+    async fn run_learning_agent(
+        &self,
+        settings: &ApiSettings,
+        topic: Option<&str>,
+        initial_concept_json: Option<&str>,
+        initial_explanation: Option<&str>,
+        previous_exercises_json: Option<&str>,
+        progress: Option<&ProgressReporter>,
+    ) -> Result<LearningAgentOutput, AiError> {
+        const MAX_ACTIONS: usize = 48;
         const MIN_EXERCISES: usize = 4;
         const MAX_EXERCISES: usize = 6;
 
-        let mut accepted = Vec::new();
+        let mut topic_result: Option<TopicExplanationWire> = None;
+        let mut raw_response = String::new();
+        let mut concept_json = initial_concept_json.unwrap_or_default().to_string();
+        let mut explanation = initial_explanation.unwrap_or_default().to_string();
+        let mut accepted: Vec<ExerciseWire> = Vec::new();
         let mut rejected: Vec<RejectedExerciseWire> = Vec::new();
+        let mut candidate: Option<AgentCandidate> = None;
+        let mut observation = "开始学习任务。".to_string();
 
-        for action in 0..MAX_AGENT_ACTIONS {
+        for turn in 1..=MAX_ACTIONS {
             self.check_cancelled()?;
-            report_progress(progress, "技能 curriculum 正在选择下一步练习动作...");
-            let accepted_json = serde_json::to_string_pretty(&accepted)?;
-            let rejected_json = serde_json::to_string_pretty(&rejected)?;
-            let decision_raw = self.chat_completion(
-                "agent.curriculum",
-                settings,
-                vec![
-                    ChatMessageWire::system(crate::skills::load("curriculum")),
-                    ChatMessageWire::user(format!(
-                        "Concept: {concept_json}\nExplanation: {explanation_context}\nPrevious exercises: {}\nAccepted: {accepted_json}\nRejected: {rejected_json}\nAction {}/{}. Return only JSON {{\"action\":\"draft_exercise|finish\",\"difficulty\":\"easy|medium|hard\",\"reason\":\"short reason\"}}. Finish requires at least {MIN_EXERCISES} accepted exercises. Maximum {MAX_EXERCISES}.",
-                        previous_exercises_json.unwrap_or("[]"), action + 1, MAX_AGENT_ACTIONS
-                    )),
-                ],
-                true,
-            ).await?;
+            report_progress(
+                progress,
+                format!("技能 curriculum 正在选择动作（{turn}/{MAX_ACTIONS}）..."),
+            );
+            let candidate_state = candidate.as_ref().map(|item| {
+                json!({
+                    "exercise": item.exercise,
+                    "context_validation": item.context_validation,
+                    "review_validation": item.review_validation,
+                    "verification": item.verification,
+                })
+            });
+            let state = json!({
+                "topic": topic,
+                "concept": concept_json,
+                "explanation": explanation,
+                "previous_exercises": previous_exercises_json.unwrap_or("[]"),
+                "accepted": accepted,
+                "rejected": rejected,
+                "candidate": candidate_state,
+                "last_observation": observation,
+                "turn": turn,
+                "max_turns": MAX_ACTIONS,
+            });
+            let decision_raw = self
+                .chat_completion(
+                    "agent.curriculum",
+                    settings,
+                    vec![
+                        ChatMessageWire::system(crate::skills::load("curriculum")),
+                        ChatMessageWire::user(format!(
+                            "Current state: {state}\nChoose exactly one next action. Return JSON {{\"action\":\"explain_topic|draft_exercise|validate_candidate|review_candidate|verify_candidate|accept_candidate|reject_candidate|finish\",\"difficulty\":\"easy|medium|hard\",\"reason\":\"short reason\"}}. A candidate must pass both text reviews and the experiment step before acceptance. Finish requires {MIN_EXERCISES}-{MAX_EXERCISES} accepted exercises covering easy, medium and hard."
+                        )),
+                    ],
+                    true,
+                )
+                .await?;
             let decision: AgentDecisionWire = self
                 .parse_ai_json_or_repair("agent.curriculum", settings, &decision_raw)
                 .await?;
-            if !matches!(decision.action.as_str(), "finish" | "draft_exercise") {
-                return Err(AiError::QualityGateFailed(
-                    "curriculum 技能返回无效动作".to_string(),
-                ));
-            }
-            if decision.action == "finish"
-                && accepted.len() >= MIN_EXERCISES
-                && has_difficulty_coverage(&accepted)
-            {
-                report_progress(
-                    progress,
-                    format!("技能 curriculum 已完成 {} 道练习。", accepted.len()),
-                );
-                break;
-            }
-            if accepted.len() >= MAX_EXERCISES {
-                break;
-            }
-            let slot = accepted.len() + 1;
-            let target_difficulty = match decision.difficulty.as_str() {
-                "easy" => "easy",
-                "medium" => "medium",
-                "hard" => "hard",
-                _ => {
-                    return Err(AiError::QualityGateFailed(
-                        "curriculum 技能返回无效难度".to_string(),
-                    ))
-                }
-            };
-            let mut accepted_this_slot = false;
             report_progress(
                 progress,
                 format!(
-                    "技能 curriculum 选择第 {slot} 道练习（难度：{target_difficulty}）：{}",
-                    decision.reason
+                    "技能 curriculum 选择 {}：{}",
+                    decision.action, decision.reason
                 ),
             );
 
-            for attempt in 1..=MAX_ATTEMPTS_PER_SLOT {
-                self.check_cancelled()?;
-                let accepted_json = serde_json::to_string_pretty(&accepted)?;
-                let rejected_json = serde_json::to_string_pretty(&rejected)?;
-                report_progress(
-                    progress,
-                    format!(
-                        "正在生成第 {slot} 道练习，第 {attempt}/{MAX_ATTEMPTS_PER_SLOT} 次尝试..."
-                    ),
-                );
-                let raw = self
-                    .chat_completion_with_search(
-                        "exercise.generate_one",
-                        settings,
-                        vec![
-                            ChatMessageWire::system(prompts::learning_system_prompt()),
-                            ChatMessageWire::user(prompts::generate_one_exercise_prompt(
-                                concept_json,
-                                explanation_context,
-                                previous_exercises_json,
-                                &accepted_json,
-                                &rejected_json,
-                                slot,
-                                target_difficulty,
-                                attempt,
-                            )),
-                        ],
-                        true,
-                        progress,
-                    )
-                    .await?;
-                report_progress(
-                    progress,
-                    format!("第 {slot} 道练习已生成，正在解析题目 JSON..."),
-                );
-                let exercise: ExerciseWire = self
-                    .parse_ai_json_or_repair("exercise.generate_one", settings, &raw)
-                    .await?;
-                let exercise_json = serde_json::to_string_pretty(&exercise)?;
-                report_progress(
-                    progress,
-                    format!("正在审查第 {slot} 道练习是否符合讲解上下文..."),
-                );
-                let validation_raw = self
-                    .chat_completion_with_search(
-                        "exercise.validate_one",
-                        settings,
-                        vec![
-                            ChatMessageWire::system(prompts::learning_system_prompt()),
-                            ChatMessageWire::user(prompts::validate_one_exercise_prompt(
-                                concept_json,
-                                explanation_context,
-                                &exercise_json,
-                                target_difficulty,
-                            )),
-                        ],
-                        true,
-                        progress,
-                    )
-                    .await?;
-                let validation: ExerciseValidationWire = self
-                    .parse_ai_json_or_repair("exercise.validate_one", settings, &validation_raw)
-                    .await?;
-
-                if validation.is_accepted() {
-                    report_progress(
-                        progress,
-                        format!("第 {slot} 道练习通过上下文审查，正在做展示前可评分性审查..."),
-                    );
-                    let gate_raw = self
+            observation = match decision.action.as_str() {
+                "explain_topic" if concept_json.is_empty() && topic.is_some() => {
+                    let raw = self
+                        .chat_completion_with_search(
+                            "concept.explain",
+                            settings,
+                            vec![
+                                ChatMessageWire::system(prompts::learning_system_prompt()),
+                                ChatMessageWire::user(prompts::explain_topic_prompt(
+                                    topic.unwrap(),
+                                )),
+                            ],
+                            true,
+                            progress,
+                        )
+                        .await?;
+                    let parsed: TopicExplanationWire = self
+                        .parse_ai_json_or_repair("concept.explain", settings, &raw)
+                        .await?;
+                    concept_json = serde_json::to_string_pretty(&parsed.concept)?;
+                    explanation = parsed.explanation.clone();
+                    topic_result = Some(parsed);
+                    raw_response = raw;
+                    "讲解已生成，可以设计练习。".to_string()
+                }
+                "draft_exercise"
+                    if !concept_json.is_empty()
+                        && candidate.is_none()
+                        && accepted.len() < MAX_EXERCISES =>
+                {
+                    if !matches!(decision.difficulty.as_str(), "easy" | "medium" | "hard") {
+                        "难度无效，请选择 easy、medium 或 hard。".to_string()
+                    } else {
+                        let slot = accepted.len() + 1;
+                        let attempt = rejected.len() + 1;
+                        let raw = self
+                            .chat_completion_with_search(
+                                "exercise.generate_one",
+                                settings,
+                                vec![
+                                    ChatMessageWire::system(prompts::learning_system_prompt()),
+                                    ChatMessageWire::user(prompts::generate_one_exercise_prompt(
+                                        &concept_json,
+                                        &explanation,
+                                        previous_exercises_json,
+                                        &serde_json::to_string_pretty(&accepted)?,
+                                        &serde_json::to_string_pretty(&rejected)?,
+                                        slot,
+                                        &decision.difficulty,
+                                        attempt,
+                                    )),
+                                ],
+                                true,
+                                progress,
+                            )
+                            .await?;
+                        let exercise: ExerciseWire = self
+                            .parse_ai_json_or_repair("exercise.generate_one", settings, &raw)
+                            .await?;
+                        if exercise.difficulty != decision.difficulty {
+                            rejected.push(RejectedExerciseWire {
+                                exercise,
+                                validation: ExerciseValidationWire::rejected(
+                                    "生成题目的难度与技能选择不一致",
+                                ),
+                            });
+                            "题目难度不一致，已退回。".to_string()
+                        } else {
+                            candidate = Some(AgentCandidate::new(exercise));
+                            "候选题目已生成，请审查其上下文与可评分性。".to_string()
+                        }
+                    }
+                }
+                "validate_candidate"
+                    if candidate
+                        .as_ref()
+                        .is_some_and(|item| item.context_validation.is_none()) =>
+                {
+                    let item = candidate.as_mut().unwrap();
+                    let exercise_json = serde_json::to_string_pretty(&item.exercise)?;
+                    let raw = self
+                        .chat_completion_with_search(
+                            "exercise.validate_one",
+                            settings,
+                            vec![
+                                ChatMessageWire::system(prompts::learning_system_prompt()),
+                                ChatMessageWire::user(prompts::validate_one_exercise_prompt(
+                                    &concept_json,
+                                    &explanation,
+                                    &exercise_json,
+                                    &item.exercise.difficulty,
+                                )),
+                            ],
+                            true,
+                            progress,
+                        )
+                        .await?;
+                    let validation: ExerciseValidationWire = self
+                        .parse_ai_json_or_repair("exercise.validate_one", settings, &raw)
+                        .await?;
+                    let summary = validation.summary();
+                    item.context_validation = Some(validation);
+                    format!("上下文审查完成：{summary}")
+                }
+                "review_candidate"
+                    if candidate
+                        .as_ref()
+                        .is_some_and(|item| item.review_validation.is_none()) =>
+                {
+                    let item = candidate.as_mut().unwrap();
+                    let exercise_json = serde_json::to_string_pretty(&item.exercise)?;
+                    let raw = self
                         .chat_completion_with_search(
                             "exercise.review_gate",
                             settings,
@@ -469,73 +568,83 @@ impl AiClient {
                             progress,
                         )
                         .await?;
-                    let gate_validation: ExerciseValidationWire = self
-                        .parse_ai_json_or_repair("exercise.review_gate", settings, &gate_raw)
+                    let validation: ExerciseValidationWire = self
+                        .parse_ai_json_or_repair("exercise.review_gate", settings, &raw)
                         .await?;
-
-                    if !gate_validation.is_accepted() {
-                        report_progress(
-                            progress,
-                            format!("第 {slot} 道练习展示前审查未通过，正在重试生成..."),
-                        );
-                        rejected.push(RejectedExerciseWire {
-                            exercise,
-                            validation: gate_validation,
-                        });
-                        continue;
-                    }
-
-                    let mut exercise = exercise;
-                    let evidence = self
-                        .verify_exercise_in_sandbox(settings, &exercise, progress)
-                        .await?;
-                    if evidence.status == "contradicted" {
-                        rejected.push(RejectedExerciseWire {
-                            exercise,
-                            validation: ExerciseValidationWire {
-                                verdict: "rejected".to_string(),
-                                checked_claims: vec!["沙箱实际输出与题目预期对照".to_string()],
-                                blocking_issues: vec![evidence.note],
-                                risk_notes: Vec::new(),
-                            },
-                        });
-                        continue;
-                    }
-                    exercise.verification = Some(evidence);
-                    accepted.push(exercise);
-                    accepted_this_slot = true;
-                    report_progress(progress, format!("第 {slot} 道练习已通过全部审查。"));
-                    break;
+                    let summary = validation.summary();
+                    item.review_validation = Some(validation);
+                    format!("可评分性审查完成：{summary}")
                 }
-
-                report_progress(
-                    progress,
-                    format!("第 {slot} 道练习上下文审查未通过，正在重试生成..."),
-                );
-                rejected.push(RejectedExerciseWire {
-                    exercise,
-                    validation,
-                });
-            }
-
-            if !accepted_this_slot {
-                report_progress(
-                    progress,
-                    format!("第 {slot} 道练习未通过审查，技能将读取原因并重新决策。"),
-                );
-            }
+                "verify_candidate"
+                    if candidate
+                        .as_ref()
+                        .is_some_and(|item| item.verification.is_none()) =>
+                {
+                    let item = candidate.as_mut().unwrap();
+                    let evidence = self
+                        .verify_exercise_in_sandbox(settings, &item.exercise, progress)
+                        .await?;
+                    let status = evidence.status.clone();
+                    let note = evidence.note.clone();
+                    item.verification = Some(evidence);
+                    format!("实验状态：{status}。{note}")
+                }
+                "accept_candidate"
+                    if candidate.as_ref().is_some_and(AgentCandidate::can_accept) =>
+                {
+                    let mut item = candidate.take().unwrap();
+                    item.exercise.verification = item.verification.take();
+                    accepted.push(item.exercise);
+                    format!("已接纳第 {} 道练习。", accepted.len())
+                }
+                "reject_candidate" if candidate.is_some() => {
+                    let item = candidate.take().unwrap();
+                    let validation = item
+                        .context_validation
+                        .filter(|result| !result.is_accepted())
+                        .or_else(|| {
+                            item.review_validation
+                                .filter(|result| !result.is_accepted())
+                        })
+                        .or_else(|| {
+                            item.verification.as_ref().and_then(|evidence| {
+                                (evidence.status == "contradicted")
+                                    .then(|| ExerciseValidationWire::rejected(&evidence.note))
+                            })
+                        })
+                        .unwrap_or_else(|| {
+                            ExerciseValidationWire::rejected(&format!(
+                                "技能主动退回候选题：{}",
+                                decision.reason
+                            ))
+                        });
+                    rejected.push(RejectedExerciseWire {
+                        exercise: item.exercise,
+                        validation,
+                    });
+                    "候选题已退回，下一次出题会收到退回原因。".to_string()
+                }
+                "finish"
+                    if candidate.is_none()
+                        && accepted.len() >= MIN_EXERCISES
+                        && has_difficulty_coverage(&accepted) =>
+                {
+                    return Ok(LearningAgentOutput {
+                        topic: topic_result,
+                        raw_response,
+                        exercises: accepted,
+                    });
+                }
+                _ => "当前状态不允许这个动作；请读取候选题和审查状态后重新选择。".to_string(),
+            };
+            report_progress(progress, format!("Agent 观察：{observation}"));
         }
 
-        if accepted.len() < MIN_EXERCISES || !has_difficulty_coverage(&accepted) {
-            return Err(AiError::QualityGateFailed(format!(
-                "技能预算耗尽，{} 道练习通过审查，未满足至少 {MIN_EXERCISES} 道且覆盖 easy、medium、hard 的要求",
-                accepted.len()
-            )));
-        }
-
-        Ok(ExerciseSetWire {
-            exercises: accepted,
-        })
+        Err(AiError::QualityGateFailed(format!(
+            "技能动作预算耗尽：{} 道练习通过审查；最后观察：{}",
+            accepted.len(),
+            observation
+        )))
     }
 
     async fn verify_exercise_in_sandbox(
@@ -2000,6 +2109,44 @@ struct ExerciseSetWire {
     exercises: Vec<ExerciseWire>,
 }
 
+struct LearningAgentOutput {
+    topic: Option<TopicExplanationWire>,
+    raw_response: String,
+    exercises: Vec<ExerciseWire>,
+}
+
+struct AgentCandidate {
+    exercise: ExerciseWire,
+    context_validation: Option<ExerciseValidationWire>,
+    review_validation: Option<ExerciseValidationWire>,
+    verification: Option<VerificationEvidence>,
+}
+
+impl AgentCandidate {
+    fn new(exercise: ExerciseWire) -> Self {
+        Self {
+            exercise,
+            context_validation: None,
+            review_validation: None,
+            verification: None,
+        }
+    }
+
+    fn can_accept(&self) -> bool {
+        self.context_validation
+            .as_ref()
+            .is_some_and(ExerciseValidationWire::is_accepted)
+            && self
+                .review_validation
+                .as_ref()
+                .is_some_and(ExerciseValidationWire::is_accepted)
+            && self
+                .verification
+                .as_ref()
+                .is_some_and(|evidence| evidence.status != "contradicted")
+    }
+}
+
 fn has_difficulty_coverage(exercises: &[ExerciseWire]) -> bool {
     ["easy", "medium", "hard"].iter().all(|difficulty| {
         exercises
@@ -2011,7 +2158,9 @@ fn has_difficulty_coverage(exercises: &[ExerciseWire]) -> bool {
 #[derive(Debug, Deserialize)]
 struct AgentDecisionWire {
     action: String,
+    #[serde(default)]
     difficulty: String,
+    #[serde(default)]
     reason: String,
 }
 
@@ -2039,6 +2188,15 @@ struct ExerciseValidationWire {
 }
 
 impl ExerciseValidationWire {
+    fn rejected(reason: &str) -> Self {
+        Self {
+            verdict: "rejected".to_string(),
+            checked_claims: Vec::new(),
+            blocking_issues: vec![reason.to_string()],
+            risk_notes: Vec::new(),
+        }
+    }
+
     fn is_accepted(&self) -> bool {
         self.verdict.trim().eq_ignore_ascii_case("accepted")
     }
@@ -2331,6 +2489,123 @@ fn truncate_text(value: &str, max_chars: usize) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn candidate_requires_reviews_and_non_conflicting_experiment() {
+        let exercise = ExerciseWire {
+            kind: ExerciseKind::PredictCompileResult,
+            title: "输出".to_string(),
+            prompt: "预测输出".to_string(),
+            starter_code: "print(42)".to_string(),
+            expected_answer: "42".to_string(),
+            hints: Vec::new(),
+            difficulty: "easy".to_string(),
+            verification: None,
+        };
+        let mut candidate = AgentCandidate::new(exercise);
+        assert!(!candidate.can_accept());
+        let accepted = ExerciseValidationWire {
+            verdict: "accepted".to_string(),
+            checked_claims: Vec::new(),
+            blocking_issues: Vec::new(),
+            risk_notes: Vec::new(),
+        };
+        candidate.context_validation = Some(accepted.clone());
+        candidate.review_validation = Some(accepted);
+        assert!(!candidate.can_accept());
+        candidate.verification = Some(VerificationEvidence {
+            status: "contradicted".to_string(),
+            ..Default::default()
+        });
+        assert!(!candidate.can_accept());
+        candidate.verification.as_mut().unwrap().status = "verified".to_string();
+        assert!(candidate.can_accept());
+    }
+
+    #[test]
+    fn review_agent_cannot_grade_before_question_audit() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut actions = 0;
+            let mut grade_requests = 0;
+            for _ in 0..6 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut received = Vec::new();
+                let mut buffer = [0_u8; 8192];
+                loop {
+                    let count = socket.read(&mut buffer).unwrap();
+                    received.extend_from_slice(&buffer[..count]);
+                    let Some(header_end) = received.windows(4).position(|part| part == b"\r\n\r\n")
+                    else {
+                        continue;
+                    };
+                    let header =
+                        String::from_utf8_lossy(&received[..header_end]).to_ascii_lowercase();
+                    let length = header
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length: "))
+                        .unwrap()
+                        .parse::<usize>()
+                        .unwrap();
+                    if received.len() >= header_end + 4 + length {
+                        break;
+                    }
+                }
+                let header_end = received
+                    .windows(4)
+                    .position(|part| part == b"\r\n\r\n")
+                    .unwrap();
+                let payload: Value = serde_json::from_slice(&received[header_end + 4..]).unwrap();
+                let system = payload["messages"][0]["content"].as_str().unwrap_or("");
+                let user = payload["messages"][1]["content"].as_str().unwrap_or("");
+                let content = if system.contains("name: answer-review") {
+                    actions += 1;
+                    let action =
+                        ["grade_answer", "audit_question", "grade_answer", "finish"][actions - 1];
+                    json!({"action":action,"reason":"test transition"})
+                } else if user.contains("Review Gate agent") {
+                    assert_eq!(grade_requests, 0);
+                    json!({"verdict":"accepted","checked_claims":[],"blocking_issues":[],"risk_notes":[]})
+                } else {
+                    assert!(user.contains("Review the learner answer"));
+                    grade_requests += 1;
+                    json!({"is_correct":true,"score":100,"summary":"正确","mistakes":[],"corrected_answer":"42","next_steps":[]})
+                };
+                let body = json!({"choices":[{"message":{"content":content.to_string()},"finish_reason":"stop"}]}).to_string();
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            }
+            (actions, grade_requests)
+        });
+        let mut settings = ApiSettings::default();
+        settings.base_url = format!("http://{address}/v1");
+        settings.api_key = "test-key".to_string();
+        settings.selected_model = "mock-model".to_string();
+        let exercise = Exercise::new(
+            None,
+            ExerciseKind::FillBlank,
+            "输出",
+            "打印什么",
+            "print(42)",
+            "42",
+            Vec::new(),
+            "easy",
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let result = runtime
+            .block_on(AiClient::default().review_attempt(&settings, &exercise, "42", None))
+            .unwrap();
+        let (actions, grade_requests) = server.join().unwrap();
+        assert_eq!(actions, 4);
+        assert_eq!(grade_requests, 1);
+        assert!(result.is_correct);
+    }
     use serde_json::Value;
 
     #[test]
@@ -2532,10 +2807,13 @@ mod tests {
         let address = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
         let server = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
             let mut request_count = 0;
             let mut curriculum_count = 0;
-            while std::time::Instant::now() < deadline && request_count < 18 {
+            let mut validation_count = 0;
+            let mut saw_rejection = false;
+            let mut saw_early_verification = false;
+            'requests: while std::time::Instant::now() < deadline && request_count < 41 {
                 let (mut socket, _) = match listener.accept() {
                     Ok(pair) => pair,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -2545,12 +2823,24 @@ mod tests {
                     Err(error) => panic!("mock accept failed: {error}"),
                 };
                 socket
-                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .set_read_timeout(Some(Duration::from_secs(5)))
                     .unwrap();
                 let mut received = Vec::new();
                 let mut buffer = [0_u8; 8192];
                 loop {
-                    let count = socket.read(&mut buffer).unwrap();
+                    let count = match socket.read(&mut buffer) {
+                        Ok(0) => continue 'requests,
+                        Ok(count) => count,
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            continue 'requests;
+                        }
+                        Err(error) => panic!("mock read failed: {error}"),
+                    };
                     received.extend_from_slice(&buffer[..count]);
                     let Some(header_end) = received.windows(4).position(|part| part == b"\r\n\r\n")
                     else {
@@ -2577,12 +2867,46 @@ mod tests {
                 let user = payload["messages"][1]["content"].as_str().unwrap_or("");
                 let content = if system.contains("name: curriculum") {
                     curriculum_count += 1;
-                    if curriculum_count == 5 {
-                        json!({"action":"finish","difficulty":"hard","reason":"coverage complete"})
+                    let state: Value = serde_json::from_str(
+                        user.strip_prefix("Current state: ")
+                            .unwrap()
+                            .split("\nChoose exactly")
+                            .next()
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    let candidate = &state["candidate"];
+                    let accepted = state["accepted"].as_array().unwrap().len();
+                    saw_rejection |= !state["rejected"].as_array().unwrap().is_empty();
+                    let action = if curriculum_count == 1 {
+                        "finish"
+                    } else if state["concept"].as_str().unwrap().is_empty() {
+                        "explain_topic"
+                    } else if !candidate.is_null() {
+                        if accepted == 0 && saw_rejection && candidate["verification"].is_null() {
+                            saw_early_verification = candidate["context_validation"].is_null();
+                            "verify_candidate"
+                        } else if candidate["context_validation"].is_null() {
+                            "validate_candidate"
+                        } else if candidate["context_validation"]["verdict"] == "rejected" {
+                            "reject_candidate"
+                        } else if candidate["review_validation"].is_null() {
+                            "review_candidate"
+                        } else if candidate["verification"].is_null() {
+                            "verify_candidate"
+                        } else {
+                            "accept_candidate"
+                        }
+                    } else if accepted == 4 {
+                        "finish"
                     } else {
-                        let difficulty = ["easy", "medium", "hard", "hard"][curriculum_count - 1];
-                        json!({"action":"draft_exercise","difficulty":difficulty,"reason":"next gap"})
-                    }
+                        "draft_exercise"
+                    };
+                    let difficulty = ["easy", "medium", "hard", "hard"]
+                        .get(accepted)
+                        .copied()
+                        .unwrap_or("hard");
+                    json!({"action":action,"difficulty":difficulty,"reason":"next gap"})
                 } else if user.contains("Concept Explainer agent") {
                     json!({"topic_title":"Python 变量","explanation":"Python 变量与打印。","concept":{"title":"变量","language":"Python","summary":"变量保存值。","key_points":["赋值", "打印"]}})
                 } else if user.contains("Exercise Writer agent") {
@@ -2591,6 +2915,13 @@ mod tests {
                         .unwrap();
                     let difficulty = ["easy", "medium", "hard", "hard"][slot - 1];
                     json!({"kind":"FillBlank","title":format!("题目 {slot}"),"prompt":"打印变量","starter_code":"x = 1\nprint(x)","expected_answer":"1","hints":[],"difficulty":difficulty})
+                } else if user.contains("Skeptical Exercise Validator agent") {
+                    validation_count += 1;
+                    if validation_count == 1 {
+                        json!({"verdict":"rejected","checked_claims":[],"blocking_issues":["first draft needs revision"],"risk_notes":[]})
+                    } else {
+                        json!({"verdict":"accepted","checked_claims":[],"blocking_issues":[],"risk_notes":[]})
+                    }
                 } else {
                     json!({"verdict":"accepted","checked_claims":[],"blocking_issues":[],"risk_notes":[]})
                 };
@@ -2598,7 +2929,12 @@ mod tests {
                 write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
                 request_count += 1;
             }
-            (request_count, curriculum_count)
+            (
+                request_count,
+                curriculum_count,
+                saw_rejection,
+                saw_early_verification,
+            )
         });
         let mut settings = ApiSettings::default();
         settings.base_url = format!("http://{address}/v1");
@@ -2608,9 +2944,11 @@ mod tests {
         let result = runtime
             .block_on(AiClient::default().explain_and_generate(&settings, "Python 变量", None))
             .unwrap();
-        let (requests, decisions) = server.join().unwrap();
-        assert_eq!(requests, 18);
-        assert_eq!(decisions, 5);
+        let (requests, decisions, saw_rejection, saw_early_verification) = server.join().unwrap();
+        assert_eq!(requests, 41);
+        assert_eq!(decisions, 26);
+        assert!(saw_rejection);
+        assert!(saw_early_verification);
         assert_eq!(result.exercises.len(), 4);
         assert!(result.exercises.iter().all(|exercise| exercise
             .verification
