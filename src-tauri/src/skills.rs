@@ -12,7 +12,10 @@ pub struct SkillInfo {
 }
 
 fn custom_path(name: &str) -> Option<PathBuf> {
-    if !matches!(name, "curriculum" | "experiment-verification") {
+    if !matches!(
+        name,
+        "curriculum" | "experiment-verification" | "answer-review"
+    ) {
         return None;
     }
     crate::app::storage_path()?
@@ -38,14 +41,16 @@ pub fn load(name: &str) -> String {
         "experiment-verification" => {
             include_str!("../skills/experiment-verification/SKILL.md").to_string()
         }
+        "answer-review" => include_str!("../skills/answer-review/SKILL.md").to_string(),
         _ => String::new(),
     })
 }
 
 pub fn list() -> Vec<SkillInfo> {
     [
-        ("curriculum", "选择练习动作、难度与结束时机"),
+        ("curriculum", "选择讲解、出题、审查、实验与结束动作"),
         ("experiment-verification", "设计并核对沙箱实验"),
+        ("answer-review", "控制题目审查与答案评审动作"),
     ]
     .into_iter()
     .map(|(name, description)| SkillInfo {
@@ -68,5 +73,7 @@ mod tests {
     fn only_registered_skill_paths_are_allowed() {
         assert!(custom_path("../curriculum").is_none());
         assert!(load("curriculum").contains("name: curriculum"));
+        assert!(load("answer-review").contains("name: answer-review"));
+        assert!(list().iter().any(|skill| skill.name == "answer-review"));
     }
 }
